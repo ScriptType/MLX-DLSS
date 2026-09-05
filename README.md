@@ -52,8 +52,12 @@ Frame generation: even frames in, generated frames out, the withheld frames for 
 | neural rendering | `nvngx_dlssnr.dll` (file version 310.8.0.0, SHA-256 `ceb6432f…2650`) | `mlxdlss-weights all nvngx_dlssnr.dll weights/ [--coreml 320x320]` | `weights/dlssnr-weights-logical.safetensors` (PyTorch), `weights/NeuralRendering.dlssmodel` (Metal), `weights/NeuralRendering-WxH-float16.mlpackage` (Core ML) |
 | frame generation | `libnvidia-ngx-dlssg.so.310.7.0` (DLSS SDK 310.7.0) | `mlxdlss-weights extract-fg libnvidia-ngx-dlssg.so.310.7.0 weights/framegen.safetensors` | `weights/framegen.safetensors` (both backends) |
 
-`mlxdlss-weights sha256 FILE` reports whether a DLL is a known checkpoint;
-`mlxdlss-weights inspect PACKED` lists the tensors of an unknown version.
+`mlxdlss-weights sha256 FILE` reports whether a DLL is the supported build;
+`mlxdlss-weights inspect PACKED` lists the tensors of an unknown version. The
+DLL ships in NVIDIA's Streamline SDK package (`bin/x64/nvngx_dlssnr.dll`) and
+with games that carry DLSS 5. Version numbers such as `dlssnr-logical-v18`
+in the tool output are revisions of this project's decoder, not NVIDIA
+releases; there is one supported DLL build.
 
 ## Install and build
 

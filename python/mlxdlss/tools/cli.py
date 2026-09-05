@@ -7,8 +7,9 @@
     mlxdlss-weights all      nvngx_dlssnr.dll OUTPUT_DIR [--coreml WxH ...]             # everything in one go
     mlxdlss-weights inspect  packed.safetensors                     # list what an (unknown) DLL version contains
 
-The DLL is never redistributed: users take it from their own NVIDIA driver or
-Streamline package. The supported checkpoint is identified by its SHA-256.
+The DLL is never redistributed: users take it from their own NVIDIA driver,
+game install or Streamline SDK package (bin/x64/nvngx_dlssnr.dll). The
+supported build is identified by its SHA-256 and FileVersion 310.8.0.0.
 """
 from __future__ import annotations
 
@@ -18,12 +19,14 @@ import pathlib
 import sys
 
 KNOWN_DLL_SHA256 = {
-    # nvngx_dlssnr.dll carrying the v19 neural-rendering checkpoint (WEIGHTS_HT resource, 153 packed tensors)
-    "ceb6432f6fbdf44d886014bcd47241932bf8b67439feef9bbdd0961436662650": "nvngx_dlssnr.dll, neural-rendering checkpoint v19",
+    # the supported nvngx_dlssnr.dll: FileVersion 310.8.0.0 (WEIGHTS_HT resource, 153 packed tensors).
+    # There is no separate "checkpoint version": the vNN numbers elsewhere in this project
+    # (dlssnr-logical-v18, package names) are revisions of this decoder, not NVIDIA releases.
+    "ceb6432f6fbdf44d886014bcd47241932bf8b67439feef9bbdd0961436662650": "supported nvngx_dlssnr.dll (FileVersion 310.8.0.0)",
     # its packed intermediate as written by `mlxdlss-weights extract`
-    "08a39bcd6c032c5fec20821c44abfd99a8ad85bbff460e5cc945f35ba67d67a3": "dlssnr-weights-packed.safetensors (WEIGHTS_HT of the v19 DLL)",
+    "08a39bcd6c032c5fec20821c44abfd99a8ad85bbff460e5cc945f35ba67d67a3": "dlssnr-weights-packed.safetensors (WEIGHTS_HT of the supported DLL)",
     # the same intermediate as produced by the earlier standalone extractor
-    "1febdf3e3fc868b48e330cea21903927303fb14cd87766169e24bbdf288a9473": "dlssnr-weights-packed.safetensors (v19, earlier extractor metadata)",
+    "1febdf3e3fc868b48e330cea21903927303fb14cd87766169e24bbdf288a9473": "dlssnr-weights-packed.safetensors (supported DLL, earlier extractor metadata)",
 }
 
 
