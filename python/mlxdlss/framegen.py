@@ -240,9 +240,10 @@ class FrameGenerator:
         return [frames[i] for i in range(n)]
 
     @torch.no_grad()
-    def generate_pairs(self, frames: list[np.ndarray], factor: int = 2) -> list[list[np.ndarray]]:
+    def generate_pairs(self, frames: list[np.ndarray], factor: int = 2, *, as_uint8: bool = True) -> list[list[np.ndarray]]:
         """For consecutive frames f0..fk, the generated frames of every pair (f_i, f_{i+1}) in one batch
-        of (k * (factor - 1)) samples; returns one list per pair."""
+        of (k * (factor - 1)) samples; returns one list per pair. ``as_uint8=False``
+        preserves float32 RGB for following effects, without intermediate quantization."""
         if factor < 2:
             raise ValueError("factor must be >= 2")
         if len(frames) < 2:
@@ -255,5 +256,7 @@ class FrameGenerator:
         b_n = b_t.repeat_interleave(n, 0)
         phases = torch.tensor([k / factor for k in range(1, factor)] * pairs, device=a_t.device, dtype=a_t.dtype)
         out = self.compose(a_n, b_n, self.synthesize(a_n, b_n, phases))
-        arr = (out.permute(0, 2, 3, 1).float().clamp(0, 1).cpu().numpy() * 255.0 + 0.5).astype(np.uint8)
+        arr = out.permute(0, 2, 3, 1).float().clamp(0, 1).cpu().numpy()
+        if as_uint8:
+            arr = (arr * 255.0 + 0.5).astype(np.uint8)
         return [[arr[p * n + i] for i in range(n)] for p in range(pairs)]

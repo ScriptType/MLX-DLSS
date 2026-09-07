@@ -40,14 +40,22 @@ def gaussian_kernel(sigma: float) -> np.ndarray:
 
 
 def blur(plane: np.ndarray, kernel: np.ndarray) -> np.ndarray:
-    """Separable convolution with edge replication (vImage kvImageEdgeExtend)."""
+    """Separable spatial convolution of HW or HWC with edge replication."""
+    try:
+        import cv2
+    except ImportError:
+        pass  # The base image package does not require the video extra.
+    else:
+        return cv2.sepFilter2D(np.asarray(plane, np.float32), -1, kernel, kernel,
+                               borderType=cv2.BORDER_REPLICATE).reshape(plane.shape)
     extent = (len(kernel) - 1) // 2
-    padded = np.pad(plane, ((0, 0), (extent, extent)), mode="edge")
+    channel_padding = ((0, 0),) * (plane.ndim - 2)
+    padded = np.pad(plane, ((0, 0), (extent, extent)) + channel_padding, mode="edge")
     horizontal = np.zeros_like(plane, dtype=np.float32)
     width = plane.shape[1]
     for index, weight in enumerate(kernel):
         horizontal += np.float32(weight) * padded[:, index : index + width]
-    padded = np.pad(horizontal, ((extent, extent), (0, 0)), mode="edge")
+    padded = np.pad(horizontal, ((extent, extent), (0, 0)) + channel_padding, mode="edge")
     vertical = np.zeros_like(plane, dtype=np.float32)
     height = plane.shape[0]
     for index, weight in enumerate(kernel):
@@ -99,12 +107,6 @@ def compose_detail(
     if detail_strength == 1 and colour_strength == 1:
         return output
     kernel = gaussian_kernel(radius)
-    result = np.empty_like(source)
-    for channel in range(source.shape[2]):
-        change = output[..., channel] - source[..., channel]
-        low = blur(change, kernel)
-        high = change - low
-        result[..., channel] = np.clip(
-            source[..., channel] + np.float32(colour_strength) * low + np.float32(detail_strength) * high, 0, 1
-        )
-    return result
+    change = output - source
+    low = blur(change, kernel)
+    return np.clip(source + np.float32(colour_strength) * low + np.float32(detail_strength) * (change - low), 0, 1)

@@ -29,3 +29,10 @@ DIS flow to reproject rendered history, rejects unreliable correspondence, and
 resets on scene changes. Scales 1–4 work on both PyTorch and the rebuilt Metal
 stream; history is retained before display detail enhancement. Existing saved
 jobs retain their explicit settings. See the repository README for controls.
+
+Temporal video prepares one following frame on a CPU worker while rendering
+the current frame (`--no-prefetch` disables this). The Metal adapter uses stream
+protocol 3, so rebuild the Swift binary when updating Python. The web effect
+chain decodes and encodes once and preserves float32 frames between NR and FG
+in both orders. OpenCV also accelerates the existing detail filter; the base
+image installation retains its NumPy fallback.

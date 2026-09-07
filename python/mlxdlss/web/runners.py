@@ -1,9 +1,7 @@
 """Executes a job's effect chain with the package's own pipelines.
 
-Images take neural rendering (torch); videos run the effects in order through
-intermediate files: neural rendering via ``video.convert`` (torch, or the Swift
-runtime on macOS) and frame generation via ``framegen_video.interpolate_video``
-(torch or ``mlxdlss framegen-stream``). A side-by-side preview is rendered with
+Images take neural rendering (torch); videos run the selected effects in one
+decode/effect/encode stream, using torch or the Swift Metal frame servers. A side-by-side preview is rendered with
 FFmpeg when a video job is done.
 """
 from __future__ import annotations
@@ -109,36 +107,40 @@ class JobRunner:
 
     # -- videos -------------------------------------------------------------------
     def _video(self, source: Path, folder: Path, effects, settings: Settings, report: Report, should_stop, job: Job) -> list[Path]:
-        current = source
-        stages = len(effects)
-        for index, effect in enumerate(effects):
+        from ..video import ConvertOptions
+        from ..video_pipeline import NeuralRenderStage, run_video
+
+        stages = []
+        for effect in effects:
             if should_stop():
                 raise Cancelled()
-            target = folder / (f"stage-{index + 1}.mp4" if index + 1 < stages else "result.mp4")
-            base = index / stages
-            name = "neural rendering" if isinstance(effect, NeuralRender) else f"frame generation x{effect.factor}"
-
-            def progress(done: int, total: int | None, name=name, base=base) -> None:
-                fraction = (done / total) if total else 0.0
-                report(f"{name} {done}/{total if total is not None else '?'}", base + fraction / stages, done, total)
-
             if isinstance(effect, NeuralRender):
-                job.diagnostics = self._neural_rendering_video(current, target, effect, settings, progress, should_stop)
+                stages.append(self._neural_rendering_stage(effect, settings))
             else:
-                self._frame_generation_video(current, target, effect, settings, progress, should_stop)
-            if should_stop():
-                raise Cancelled()
-            if current != source:
-                current.unlink(missing_ok=True)
-            current = target
+                stages.append(self._frame_generation_stage(effect, settings, floating=len(effects) > 1))
+        name = " → ".join("neural rendering" if isinstance(e, NeuralRender) else f"frame generation x{e.factor}" for e in effects)
+        def progress(done, total):
+            fraction = done / total if total else 0.0
+            report(f"{name} {done}/{total if total is not None else '?'}", min(0.97, fraction * 0.97), done, total)
+        target = folder / "result.mp4"
+        run_video(source, target, stages, ConvertOptions(overwrite=True, status_interval=1e9),
+                  log=lambda _m: None, progress=progress, should_stop=should_stop)
+        for stage in stages:
+            if isinstance(stage, NeuralRenderStage):
+                options = stage.options
+                job.diagnostics = {"temporal": options.temporal, "motion": options.motion if options.temporal else "none",
+                                   "processing_scale": options.enhance.get("processing_scale", 1.0), "scene_cuts": stage.scene_cuts}
+        if should_stop():
+            raise Cancelled()
         report("rendering the preview", 0.98, job.frames_done, job.frames_total)
-        preview = self._preview(source, current, folder)
+        preview = self._preview(source, target, folder)
         if preview is not None:
             job.preview = preview.name
-        return [current]
+        return [target]
 
-    def _neural_rendering_video(self, source: Path, target: Path, nr: NeuralRender, settings: Settings, progress, should_stop) -> dict:
-        from ..video import ConvertOptions, convert
+    def _neural_rendering_stage(self, nr: NeuralRender, settings: Settings):
+        from ..video import ConvertOptions
+        from ..video_pipeline import NeuralRenderStage
 
         backend = settings.resolved_backend("nr")
         enhance = {"profile": nr.profile, "processing_scale": nr.processing_scale, "detail_strength": nr.detail_strength,
@@ -154,12 +156,11 @@ class JobRunner:
                 raise ValueError("set the neural rendering weights (logical safetensors) in Settings")
             pipeline = self.cache.neural_rendering(settings.nr_weights, settings.device, settings.precision)
             options = ConvertOptions(temporal=nr.temporal, overwrite=True, status_interval=1e9, enhance=enhance)
-        result = convert(source, target, pipeline, options, log=lambda _m: None, progress=progress, should_stop=should_stop)
-        return {"temporal": result.temporal, "motion": result.motion, "processing_scale": result.processing_scale,
-                "scene_cuts": result.scene_cuts}
+        return NeuralRenderStage(pipeline, options)
 
-    def _frame_generation_video(self, source: Path, target: Path, fg: FrameGen, settings: Settings, progress, should_stop) -> None:
-        from ..framegen_video import FrameGenOptions, interpolate_video
+    def _frame_generation_stage(self, fg: FrameGen, settings: Settings, *, floating=False):
+        from ..framegen_video import FrameGenOptions
+        from ..video_pipeline import FrameGenerationStage
 
         if not settings.fg_weights:
             raise ValueError("set the frame generation weights (mlxdlss-weights extract-fg) in Settings")
@@ -170,7 +171,7 @@ class JobRunner:
         if backend == "torch":
             precision = "fast" if settings.precision == "fast" else "reference"
             generator = self.cache.frame_generator(settings.fg_weights, settings.device, precision)
-        interpolate_video(source, target, generator, options, log=lambda _m: None, progress=progress, should_stop=should_stop)
+        return FrameGenerationStage(generator, options, floating=floating)
 
     # -- preview --------------------------------------------------------------------
     @staticmethod

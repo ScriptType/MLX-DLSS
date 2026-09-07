@@ -35,6 +35,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--decode-args", default="", help="extra FFmpeg input options, quoted, e.g. \"-vf scale=1280:-2\"")
     run.add_argument("--encode-args", default=None, help=f"FFmpeg output options replacing the default: {' '.join(DEFAULT_ENCODE_ARGS)}")
     run.add_argument("--temporal", action=argparse.BooleanOptionalAction, default=True, help="motion-compensated history (default); --no-temporal processes independent frames")
+    run.add_argument("--prefetch", action=argparse.BooleanOptionalAction, default=True, help="prepare one following temporal frame concurrently (default)")
     run.add_argument("--motion", default="flow", choices=("flow", "zero"), help="temporal motion source: OpenCV DIS optical flow or none")
     run.add_argument("--scene-cut", type=float, default=0.3, help="luma change threshold for history reset; flow mode also checks correspondence (0 disables resets)")
     run.add_argument("--blend-scale", type=float, default=None, help="cap of the learned history blend (default: recovered 0.7397)")
@@ -103,7 +104,7 @@ def main(argv: list[str] | None = None) -> int:
             start_frame=args.start_frame, frame_limit=args.frames, batch=args.batch, pixel_format=args.pix_fmt,
             decode_args=shlex.split(args.decode_args), encode_args=None if args.encode_args is None else shlex.split(args.encode_args),
             audio=args.audio, overwrite=args.overwrite, status_interval=args.status_interval,
-            temporal=args.temporal, motion=args.motion, scene_cut_threshold=args.scene_cut,
+            temporal=args.temporal, motion=args.motion, scene_cut_threshold=args.scene_cut, prefetch=args.prefetch,
             backend=args.backend, model_package=str(args.model) if args.model else None, mlxdlss=args.mlxdlss, execution=args.execution, precision=args.mlxdlss_precision,
             **({"blend_scale": args.blend_scale} if args.blend_scale is not None else {}),
             enhance={"profile": args.profile, "processing_scale": args.processing_scale, "detail_strength": args.detail_strength,

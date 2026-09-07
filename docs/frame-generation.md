@@ -62,8 +62,34 @@ the withheld frames, the vendor's library against this port (PyTorch, M2 Max):
 
 ## Speed
 
-Per generated frame on an M2 Max after warm-up (kernel compilation excluded),
-float16 unless noted:
+Current float16 Metal dispatch, M2 Max, real weights and nonconstant synthetic
+RGB inputs. These paired warm measurements include synthesis and composition
+but exclude process startup and I/O. Times below are for the **whole batch**;
+each batch produces `pairs × (factor − 1)` generated frames.
+
+| extent | pairs | factor | scalar | auto |
+| --- | --- | --- | --- | --- |
+| 960×540 | 1 | 2 | 5.30 ms | 5.30 ms |
+| 960×540 | 4 | 2 | 17.78 ms | 16.47 ms |
+| 960×540 | 4 | 4 | 49.17 ms | 45.76 ms |
+| 1920×1080 | 1 | 2 | 17.51 ms | 16.58 ms |
+| 1920×1080 | 4 | 2 | 65.16 ms | 60.68 ms |
+| 1920×1080 | 8 | 2 | 131.38 ms | 124.28 ms |
+| 1920×1080 | 4 | 3 | 127.93 ms | 122.18 ms |
+| 1920×1080 | 4 | 4 | 192.01 ms | 186.51 ms |
+
+Auto dispatch uses SIMD matrix convolutions for eligible unpooled layers
+with at least 32 output channels and 16,384 batch-inclusive pixels. Pooled
+stems stay scalar: forcing SIMD throughout the network was slower. Batch 4
+remains the default; a larger batch does not consistently reduce time per
+generated frame. Set `MLXDLSS_FG_SIMD=0` to force scalar or `=1` to use SIMD
+where supported when comparing on another Apple GPU; leave it unset for auto.
+On the tested real-weight frames, auto/scalar float16 differences stayed
+below `3.9e-4` maximum and `7.1e-6` mean absolute error. The float32 path is
+unchanged.
+
+Earlier end-to-end and cross-backend measurements, per generated frame after
+warm-up (kernel compilation excluded), float16 unless noted:
 
 | | 960×540 | 1920×1080 |
 | --- | --- | --- |
@@ -82,9 +108,11 @@ GPU time per frame much (the layers are throughput-bound already at N = 1:
 540p gains 17 % at N = 3, 1080p nothing), but it lets the frame server overlap
 the host work with the GPU: with `--batch 1` the server waits for the host
 after every frame.
-The pipe carries uint8 RGB in both directions (`--format u8`, the default;
-`f32` keeps the float protocol), which took the host side of the stream from
-22 ms to under 2 ms per 540p frame; the frames are converted on the GPU.
+Standalone FG uses uint8 RGB in both pipe directions (`--format u8`, the
+default), which took the host side of the stream from 22 ms to under 2 ms per
+540p frame; the frames are converted on the GPU. The web NR/FG chain uses
+`--format f32` in either effect order to preserve fractional detail between
+models, with one decode and one final encode.
 
 Each convolution runs as one Metal kernel with the bias, the clamped
 LeakyReLU, the residual add and the 2×2 mean pool in its epilogue (the three

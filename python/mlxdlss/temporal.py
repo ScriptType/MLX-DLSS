@@ -211,12 +211,17 @@ class FlowMotionEstimator:
         return (np.clip(luma, 0, 1) * 255 + 0.5).astype(np.uint8)
 
     def __call__(self, current: np.ndarray, previous: np.ndarray) -> np.ndarray:
-        flow = self._flow.calc(self._gray(current), self._gray(previous), None)  # current -> previous, pixels
-        height, width = current.shape[:2]
+        return self._estimate_gray(self._gray(current), self._gray(previous))
+
+    def _estimate_gray(self, current: np.ndarray, previous: np.ndarray) -> np.ndarray:
+        flow = self._flow.calc(current, previous, None)  # current -> previous, pixels
+        height, width = current.shape
         return normalize_pixel_motion(flow, scale_x=1, scale_y=1, effective_width=width, effective_height=height)
 
     def estimate(self, current, previous, *, scene_cut_threshold=0.3) -> MotionEstimate:
-        return assess_motion(current, previous, self(current, previous), self(previous, current),
+        current_gray, previous_gray = self._gray(current), self._gray(previous)
+        return assess_motion(current, previous, self._estimate_gray(current_gray, previous_gray),
+                             self._estimate_gray(previous_gray, current_gray),
                              scene_cut_threshold=scene_cut_threshold)
 
 
@@ -253,6 +258,29 @@ def resolve_motion(estimator, current, previous, motion, confidence, *, scene_cu
 
 def zero_motion(current: np.ndarray, previous: np.ndarray) -> np.ndarray:
     return np.zeros((*current.shape[:2], 2), dtype=np.float32)
+
+
+@dataclass
+class PreparedTemporalFrame:
+    source: np.ndarray
+    color: np.ndarray
+    motion: np.ndarray
+    confidence: np.ndarray | None
+    reset: bool
+    packed_color: np.ndarray | None = None
+
+
+def prepare_temporal_frame(frame: np.ndarray, estimate: MotionEstimate, scale: float, *, packed_color=None) -> PreparedTemporalFrame:
+    """CPU-only preparation; no rendered history or noise index is consumed here."""
+    height, width = (round(d * scale) for d in frame.shape[:2])
+    if (packed_color is not None and
+        (packed_color.dtype not in (np.dtype("uint8"), np.dtype("<u2")) or scale != 1)):
+        packed_color = None
+    return PreparedTemporalFrame(
+        frame, resample(frame, width, height), resize_guide(estimate.motion_uv, width, height),
+        None if estimate.confidence is None else resize_guide(estimate.confidence, width, height, confidence=True),
+        estimate.reset, packed_color,
+    )
 
 
 @dataclass
@@ -321,11 +349,13 @@ class TemporalSession:
             self.reset()
         estimate = resolve_motion(self.motion, frame, self.previous, motion, history_confidence,
                                   scene_cut_threshold=self.options.scene_cut_threshold, robust_motion=self.options.robust_motion)
-        if estimate.reset:
+        return self._process_prepared(prepare_temporal_frame(frame, estimate, self.options.processing_scale), control_mask)
+
+    def _process_prepared(self, prepared: PreparedTemporalFrame, control_mask=None) -> np.ndarray:
+        frame, processing, confidence = prepared.source, prepared.color, prepared.confidence
+        if prepared.reset:
             self.reset(); self.scene_cuts += 1
-        height, width = (round(d * self.options.processing_scale) for d in frame.shape[:2])
-        processing = resample(frame, width, height)
-        confidence = None if estimate.confidence is None else resize_guide(estimate.confidence, width, height, confidence=True)
+        height, width = processing.shape[:2]
         geometry = NetworkGeometry.vendor_aligned(width, height)
         controls = self._controls()
         if self.history is None:
@@ -333,8 +363,7 @@ class TemporalSession:
             head = geometry.crop(self.pipeline.run_features(network))
             output = compose_head(head, processing, control_mask=control_mask, intensity=self.options.intensity)
         else:
-            motion = resize_guide(estimate.motion_uv, width, height)
-            features = make_temporal_features(processing, self.history, motion, frame_index=self.frame_index,
+            features = make_temporal_features(processing, self.history, prepared.motion, frame_index=self.frame_index,
                                               history_confidence=confidence, control_mask=control_mask, **controls)
             network = extend_features(features, geometry, self.frame_index)
             head = geometry.crop(self.pipeline.run_features(network))

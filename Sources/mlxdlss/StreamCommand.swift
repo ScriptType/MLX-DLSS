@@ -12,20 +12,25 @@ import DLSSMLX
 /// before this frame), then `H*W*3` colour floats, and in temporal mode
 /// `H*W*2` normalised history-UV motion floats and `H*W*1` depth floats.
 /// Protocol 2 adds bit 1 for an optional confidence plane after depth.
+/// Protocol 3 adds bit 2 to omit constant-one depth, and bits 3 / 4 for
+/// losslessly packed uint8 / uint16 RGB. Motion, confidence and output stay float32.
 /// End of input ends the stream.
 enum StreamCommand {
   static let resetFlag: UInt32 = 1
   static let confidenceFlag: UInt32 = 2
+  static let constantDepthFlag: UInt32 = 4
+  static let uint8ColorFlag: UInt32 = 8
+  static let uint16ColorFlag: UInt32 = 16
 
   static func run(arguments: [String]) async throws {
     let parsed = try parse(arguments: arguments)
     let width = parsed.width
     let height = parsed.height
-    let head = try MLXNeuralRenderer(
+    let head = parsed.mode == .firstFrame ? try MLXNeuralRenderer(
       packageURL: parsed.modelURL,
       executionMode: parsed.executionMode,
       computePrecision: parsed.computePrecision
-    )
+    ) : nil
     let temporal: MLXNeuralRenderingDeviceTemporalBackend? =
       parsed.mode == .temporal
       ? try MLXNeuralRenderingDeviceTemporalBackend(
@@ -48,9 +53,11 @@ enum StreamCommand {
     var frames = 0
     let clock = ContinuousClock()
     let started = clock.now
+    let constantDepth = parsed.protocolVersion == 3 && parsed.mode == .temporal
+      ? try makeConstantDepth(width: width, height: height) : nil
     while let frame = try readFrame(
       from: input, width: width, height: height,
-      temporal: parsed.mode == .temporal, protocolVersion: parsed.protocolVersion
+      temporal: parsed.mode == .temporal, protocolVersion: parsed.protocolVersion, constantDepth: constantDepth
     ) {
       let flags = frame.flags
       let color = frame.inputs[0]
@@ -70,6 +77,7 @@ enum StreamCommand {
         }
         rendered = result
       } else {
+        guard let head else { throw CLIError.usage("stream: missing first-frame renderer") }
         var options = parsed.options
         options.noiseFrameIndex = UInt32(truncatingIfNeeded: frameIndex)
         rendered = try await FirstFramePipeline.render(
@@ -98,30 +106,62 @@ enum StreamCommand {
   /// Decode and validate a whole frame before the renderer can consume it.
   static func readFrame(
     from handle: FileHandle, width: Int, height: Int,
-    temporal: Bool, protocolVersion: Int
+    temporal: Bool, protocolVersion: Int, constantDepth: HostTensor? = nil
   ) throws -> (flags: UInt32, inputs: [HostTensor])? {
-    guard protocolVersion == 1 || protocolVersion == 2 else {
-      throw CLIError.usage("stream --protocol-version must be 1 or 2")
+    guard [1, 2, 3].contains(protocolVersion) else {
+      throw CLIError.usage("stream --protocol-version must be 1, 2 or 3")
     }
     guard let flags = try readWord(from: handle) else { return nil }
-    let knownFlags = protocolVersion == 2 ? resetFlag | confidenceFlag : resetFlag
+    let knownFlags = protocolVersion == 3
+      ? resetFlag | confidenceFlag | constantDepthFlag | uint8ColorFlag | uint16ColorFlag
+      : (protocolVersion == 2 ? resetFlag | confidenceFlag : resetFlag)
     guard flags & ~knownFlags == 0 else {
       throw CLIError.usage("stream: unknown frame flags for protocol version \(protocolVersion)")
     }
     let hasConfidence = flags & confidenceFlag != 0
-    guard temporal || !hasConfidence else {
-      throw CLIError.usage("stream: history confidence requires temporal mode")
+    let hasConstantDepth = flags & constantDepthFlag != 0
+    guard temporal || (!hasConfidence && !hasConstantDepth) else {
+      throw CLIError.usage("stream: history confidence and constant depth require temporal mode")
+    }
+    guard flags & (uint8ColorFlag | uint16ColorFlag) != (uint8ColorFlag | uint16ColorFlag) else {
+      throw CLIError.usage("stream: conflicting color formats")
     }
     var fields: [(String, Int)] = [("color", 3)]
     if temporal { fields += [("motion", 2), ("depth", 1)] }
     if hasConfidence { fields.append(("historyConfidence", 1)) }
     let inputs = try fields.map { name, channels in
-      guard let data = try readExactly(width * height * channels * 4, from: handle) else {
+      if name == "depth", hasConstantDepth {
+        return try constantDepth ?? makeConstantDepth(width: width, height: height)
+      }
+      let packedBytes = name == "color" ? (flags & uint8ColorFlag != 0 ? 1 : (flags & uint16ColorFlag != 0 ? 2 : 4)) : 4
+      guard var data = try readExactly(width * height * channels * packedBytes, from: handle) else {
         throw CLIError.usage("stream: truncated \(name) frame")
+      }
+      if packedBytes != 4 {
+        let count = width * height * channels
+        var floats = Data(count: count * 4)
+        floats.withUnsafeMutableBytes { output in
+          let destination = output.bindMemory(to: Float.self)
+          data.withUnsafeBytes { source in
+            for index in 0..<count {
+              destination[index] = packedBytes == 1
+                ? Float(source[index]) / 255
+                : Float(source.loadUnaligned(fromByteOffset: index * 2, as: UInt16.self).littleEndian) / 65535
+            }
+          }
+        }
+        data = floats
       }
       return try tensor(named: name, data: data, height: height, width: width, channels: channels)
     }
     return (flags, inputs)
+  }
+
+  private static func makeConstantDepth(width: Int, height: Int) throws -> HostTensor {
+    try HostTensor(
+      descriptor: TensorDescriptor(name: "depth", shape: [1, height, width, 1], dataType: .float32, layout: .nhwc),
+      bytes: [Float](repeating: 1, count: width * height).withUnsafeBytes { Data($0) }
+    )
   }
 
   private static func readWord(from handle: FileHandle) throws -> UInt32? {
@@ -201,8 +241,8 @@ enum StreamCommand {
     else {
       throw CLIError.usage("stream requires positive --width and --height")
     }
-    guard let protocolVersion = Int(values["--protocol-version"] ?? "1"), [1, 2].contains(protocolVersion) else {
-      throw CLIError.usage("stream --protocol-version must be 1 or 2")
+    guard let protocolVersion = Int(values["--protocol-version"] ?? "1"), [1, 2, 3].contains(protocolVersion) else {
+      throw CLIError.usage("stream --protocol-version must be 1, 2 or 3")
     }
     let blendScale = try floatOption("--blend-scale", values: values, default: 0.739_746_093_75)
     let mode = try enumeration(Mode.self, values["--mode"], default: .temporal, message: "stream mode must be 'temporal' or 'first-frame'")

@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
@@ -30,10 +31,32 @@ class CompositionTests(unittest.TestCase):
         plane = np.full((6, 7), 0.3, dtype=np.float32)
         np.testing.assert_allclose(blur(plane, gaussian_kernel(2.0)), plane, atol=1e-6)
 
+    def test_blur_extends_corner_and_handles_strided_input_without_opencv(self):
+        plane = np.zeros((3, 6), np.float32)
+        plane[0, 0] = 1
+        kernel = np.array([0.25, 0.5, 0.25], np.float32)
+        expected = [[0.5625, 0.1875, 0], [0.1875, 0.0625, 0], [0, 0, 0]]
+        np.testing.assert_array_equal(blur(plane[:, ::2], kernel), expected)
+        with patch.dict("sys.modules", {"cv2": None}):
+            np.testing.assert_array_equal(blur(plane[:, ::2], kernel), expected)
+        np.testing.assert_array_equal(blur(np.array([[2]], np.float32), kernel), [[2]])
+
     def test_unit_strengths_return_output_unchanged(self):
         source = np.random.default_rng(0).random((8, 8, 3)).astype(np.float32)
         output = np.clip(source + 0.1, 0, 1)
         self.assertIs(compose_detail(source, output), output)
+
+    def test_blur_keeps_rgb_channels_separate_in_native_and_numpy_paths(self):
+        rgb = np.zeros((3, 3, 3), np.float32)
+        rgb[0, 0, 0] = 1
+        rgb[..., 1] = 2
+        rgb[2, 2, 2] = 1
+        red = np.array([[0.5625, 0.1875, 0], [0.1875, 0.0625, 0], [0, 0, 0]])
+        expected = np.stack([red, np.full((3, 3), 2), red[::-1, ::-1]], axis=-1)
+        kernel = np.array([0.25, 0.5, 0.25], np.float32)
+        np.testing.assert_array_equal(blur(rgb, kernel), expected)
+        with patch.dict("sys.modules", {"cv2": None}):
+            np.testing.assert_array_equal(blur(rgb, kernel), expected)
 
     def test_zero_strengths_return_source(self):
         source = np.random.default_rng(1).random((8, 8, 3)).astype(np.float32)

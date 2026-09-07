@@ -217,6 +217,8 @@ final class FrameGenerationFusedConvTests: XCTestCase {
 
 final class FrameGenerationSimdConvTests: XCTestCase {
   func testSimdgroupConvMatchesPerPixelKernel() {
+    let previous = FrameGenerationFusedConv.simdEnabled
+    defer { FrameGenerationFusedConv.simdEnabled = previous }
     var s: UInt64 = 7
     func next() -> Float {
       s &+= 0x9E37_79B9_7F4A_7C15
@@ -224,12 +226,11 @@ final class FrameGenerationSimdConvTests: XCTestCase {
       return Float(z >> 40) / Float(1 << 24) - 0.5
     }
     func random(_ shape: [Int], scale: Float) -> MLXArray { MLXArray((0..<shape.reduce(1, *)).map { _ in next() * scale }, shape) }
-    for (cin, cout, h, w) in [(16, 32, 9, 21), (32, 32, 12, 20), (64, 64, 7, 60), (24, 16, 5, 33), (32, 96, 6, 18)] {
+    for (cin, cout, h, w) in [(8, 16, 1, 1), (24, 16, 2, 3), (32, 32, 3, 7), (16, 32, 9, 21), (32, 32, 12, 20), (64, 64, 7, 60), (24, 16, 5, 33), (32, 96, 6, 18)] {
       let x = random([1, h, w, cin], scale: 2).asType(.float16)
       let layer = FrameGenerationFusedConv.Layer(weight: random([cout, cin, 3, 3], scale: 0.3), bias: random([cout], scale: 1))
       for (activation, useResidual) in [(true, false), (false, false), (true, true)] {
         let residual = useResidual ? random([1, h, w, cout], scale: 1).asType(.float16) : nil
-        let want = FrameGenerationFusedConv.apply(x, layer, activation: activation, residual: residual, pool: false)
         FrameGenerationFusedConv.simdEnabled = false
         let reference = FrameGenerationFusedConv.apply(x, layer, activation: activation, residual: residual, pool: false)
         FrameGenerationFusedConv.simdEnabled = true
@@ -238,10 +239,48 @@ final class FrameGenerationSimdConvTests: XCTestCase {
         let diff = abs(got.asType(.float32) - reference.asType(.float32)).max().item(Float.self)
         let scale = abs(reference.asType(.float32)).max().item(Float.self)
         XCTAssertLessThan(diff, 0.02 * max(scale, 1), "cin \(cin) cout \(cout) \(h)x\(w) act \(activation) res \(useResidual): max diff \(diff) of \(scale)")
-        _ = want
       }
     }
   }
+
+  func testSIMDPoolingMatchesPerPixelOnOddAndTinyShapes() {
+    let previous = FrameGenerationFusedConv.simdEnabled
+    defer { FrameGenerationFusedConv.simdEnabled = previous }
+    for (h, w) in [(1, 1), (2, 3), (5, 7), (6, 18)] {
+      let x = sin(arange(2 * h * w * 16, dtype: .float32)).reshaped([2, h, w, 16]).asType(.float16)
+      let weight = cos(arange(32 * 16 * 9, dtype: .float32)).reshaped([32, 16, 3, 3]) * 0.03
+      let layer = FrameGenerationFusedConv.Layer(weight: weight, bias: MLXArray.zeros([32]))
+      let residual = MLXArray.ones([2, h, w, 32], dtype: .float16) * 0.1
+      FrameGenerationFusedConv.simdEnabled = false
+      let reference = FrameGenerationFusedConv.apply(x, layer, activation: true, residual: residual, pool: true)
+      FrameGenerationFusedConv.simdEnabled = true
+      let actual = FrameGenerationFusedConv.apply(x, layer, activation: true, residual: residual, pool: true)
+      XCTAssertEqual(actual.shape, [2, h / 2, w / 2, 32])
+      XCTAssertEqual(actual.dtype, .float16)
+      if actual.size > 0 {
+        XCTAssertLessThan(abs(actual.asType(.float32) - reference.asType(.float32)).max().item(Float.self), 0.002)
+      }
+    }
+  }
+
+  func testAutomaticSIMDSelectionRespectsPoolSizeAndOverrides() {
+    let previous = FrameGenerationFusedConv.simdEnabled
+    defer { FrameGenerationFusedConv.simdEnabled = previous }
+    let layer = FrameGenerationFusedConv.Layer(weight: MLXArray.zeros([64, 32, 3, 3]), bias: MLXArray.zeros([64]))
+    let small = MLXArray.zeros([1, 64, 64, 32], dtype: .float16)
+    let batched = MLXArray.zeros([4, 64, 64, 32], dtype: .float16)
+    FrameGenerationFusedConv.simdEnabled = nil
+    XCTAssertFalse(FrameGenerationFusedConv.useSIMD(small, layer, pool: false))
+    XCTAssertTrue(FrameGenerationFusedConv.useSIMD(batched, layer, pool: false))
+    XCTAssertFalse(FrameGenerationFusedConv.useSIMD(batched, layer, pool: true))
+    FrameGenerationFusedConv.simdEnabled = false
+    XCTAssertFalse(FrameGenerationFusedConv.useSIMD(batched, layer, pool: false))
+    FrameGenerationFusedConv.simdEnabled = true
+    XCTAssertTrue(FrameGenerationFusedConv.useSIMD(small, layer, pool: true))
+    let narrow = FrameGenerationFusedConv.Layer(weight: MLXArray.zeros([8, 32, 3, 3]), bias: MLXArray.zeros([8]))
+    XCTAssertFalse(FrameGenerationFusedConv.useSIMD(batched, narrow, pool: false))
+  }
+
 }
 
 final class FrameGenerationFusedInputTests: XCTestCase {

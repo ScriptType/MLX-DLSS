@@ -123,7 +123,12 @@ Both Metal and PyTorch support `--processing-scale 1–4`: history stays at the
 processing resolution, while detail controls apply after downsampling to the
 original output size. Python callers may supply engine motion as normalized
 current-to-previous UV offsets and an optional H×W×1 confidence map in [0, 1].
-Metal temporal video requires rebuilding the Swift binary for stream protocol 2.
+Motion preparation for the next frame overlaps GPU rendering by default;
+`--no-prefetch` disables the overlap for comparison. History and scene resets
+still advance in frame order. Metal temporal video requires rebuilding the
+Swift binary for stream protocol 3 (versions 1 and 2 remain accepted). Unscaled
+8/16-bit source RGB uses its original integer format on the pipe; resampled
+RGB, motion, confidence and returned RGB stay float32. Constant depth is reused.
 
 Default
 encoding: `-c:v libx264 -crf 18 -preset medium -pix_fmt yuv420p -movflags +faststart`;
@@ -145,6 +150,8 @@ New video forms and API jobs with omitted `temporal` enable it automatically.
 Saved jobs retain their settings, explicit `temporal: false` remains respected,
 and still images keep their existing behavior. Completed video jobs show the
 temporal reset count and processing scale.
+Video effects share one decoder and one encoder in either order, with float32
+frames between effects; no intermediate MP4 is created.
 HTTP API: `GET /api/effects`, `POST /api/jobs` (multipart `file` + JSON
 `effects`), `GET /api/jobs[/{id}]`, `POST /api/jobs/{id}/cancel`,
 `GET /api/jobs/{id}/output/{n}` (inline), `GET /api/jobs/{id}/download/{n}`,
@@ -195,8 +202,17 @@ middle = generator.generate(frame_a_uint8, frame_b_uint8, factor=2)[0]   # facto
 | Neural rendering, Core ML | `0.008–0.014` MAE against the DLL |
 | Temporal path | Swift and Python agree within `0.0014` MAE per frame; against NVIDIA on a 64-frame static sequence: `0.0054` MAE (`42.3` dB) with the same drift from frame 0 as the vendor; motion, jitter and mask cases not captured |
 | Frame generation | reproduces the library's output at `59.9` dB PSNR (max 3/255) on captured frames; five whole clips within `0.01–0.03` dB of the library (27.4–38.9 dB against withheld frames) |
-| Frame generation, speed (M2 Max, 960×540 / 1920×1080) | Metal float16 `6.3 / 21` ms per frame on the GPU, `6.4 / 25` ms through `mlxdlss-video framegen --backend mlxdlss`; PyTorch/MPS float16 `5.3 / 17` ms |
-| `mlxdlss stream` (video, Metal) | about 11 fps at 512×448 on an M2 Max end to end (ffmpeg, optical flow and the pipe included; features generated on the GPU), identical to `mlxdlss run-sequence` |
+| Frame generation, speed (M2 Max, 960×540 / 1920×1080) | Metal float16 auto dispatch: `5.30 / 16.58` ms per generated frame on the GPU at batch 1, `4.12 / 15.17` ms at batch 4, factor 2; startup and I/O excluded. [Batch and dispatch measurements](docs/frame-generation.md#speed) |
+| Temporal video, Metal (M2 Max) | a 228-frame 512×384, 60 fps clip with detail strength 2: `10.1–16.1 s`, versus `18.4–22.8 s` before these optimizations, including startup, optical flow, decode and encode |
+
+These are local timing ranges with other desktop GPU applications running;
+the final alternating before/after runs improved whole-clip time by about
+`1.4×`. On 24-frame raw sequences at 512×384 (scales 1 and 2) and 1920×1080,
+NR output differed from the previous implementation by at most `1.2e-7`;
+prefetch on/off was bit-exact. Checkpoints, history and model precision are
+unchanged. NR reuses scratch allocations within global-attention and FFN
+stages while retaining the existing evaluation barriers and releasing the
+cache at stage exit.
 
 Not included: DLSS Super Resolution (measured, loses to Lanczos on realistic
 content without engine motion vectors and jitter; see the note below) and the

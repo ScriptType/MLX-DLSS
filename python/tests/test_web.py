@@ -6,6 +6,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 import importlib.util
 
@@ -205,14 +206,39 @@ class ApiAndRunnerTests(unittest.TestCase):
 
     @unittest.skipUnless(HAVE_FFMPEG, "ffmpeg/ffprobe not available")
     def test_video_job_chains_frame_generation_after_neural_rendering(self):
+        from mlxdlss.video_pipeline import NeuralRenderStage
+
         src = pathlib.Path(self.directory) / "src.mp4"
         subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=64x48:rate=10:duration=0.4",
                         "-c:v", "libx264", "-pix_fmt", "yuv420p", str(src)], check=True)
         for effects in ([{"kind": "nr"}, {"kind": "fg", "factor": 2}], [{"kind": "fg", "factor": 2}, {"kind": "nr"}]):
-            response = self.client.post("/api/jobs", files={"file": ("clip.mp4", src.read_bytes(), "video/mp4")},
-                                        data={"effects": json.dumps(effects)})
-            self.assertEqual(response.status_code, 201, response.text)
-            job = self._wait(response.json()["id"], timeout=600)
+            commands = []
+            nr_inputs = []
+            popen = subprocess.Popen
+            apply = NeuralRenderStage.apply
+
+            def tracked(command, *args, **kwargs):
+                commands.append(command)
+                return popen(command, *args, **kwargs)
+
+            def observe_nr_inputs(stage, frames, width, height, **kwargs):
+                def observed_frames():
+                    try:
+                        for frame in frames:
+                            nr_inputs.append(np.array(frame, copy=True))
+                            yield frame
+                    finally:
+                        close = getattr(frames, "close", None)
+                        if close is not None:
+                            close()
+
+                return apply(stage, observed_frames(), width, height, **kwargs)
+
+            with patch("subprocess.Popen", side_effect=tracked), patch.object(NeuralRenderStage, "apply", new=observe_nr_inputs):
+                response = self.client.post("/api/jobs", files={"file": ("clip.mp4", src.read_bytes(), "video/mp4")},
+                                            data={"effects": json.dumps(effects)})
+                self.assertEqual(response.status_code, 201, response.text)
+                job = self._wait(response.json()["id"], timeout=600)
             self.assertEqual(job["state"], "done", job.get("error"))
             self.assertEqual(job["outputs"], ["result.mp4"])
             from mlxdlss.video import probe
@@ -222,3 +248,11 @@ class ApiAndRunnerTests(unittest.TestCase):
             self.assertAlmostEqual(info.fps, 20.0, places=3)
             self.assertEqual(job["preview"], "preview.mp4")
             self.assertEqual(self.client.get(f"/api/jobs/{job['id']}/preview").status_code, 200)
+            decoders = [c for c in commands if pathlib.Path(c[0]).name == "ffmpeg" and c[-1] == "-"]
+            self.assertEqual(len(decoders), 1, "the effect chain must decode once without intermediate video files")
+            if effects[0]["kind"] == "fg":
+                self.assertEqual(len(nr_inputs), 7)
+                generated = nr_inputs[1::2]
+                self.assertTrue(all(np.any(np.abs(frame * 255 - np.rint(frame * 255)) > 1e-5) for frame in generated),
+                                "generated frames must retain fractional 8-bit detail until neural rendering")
+                self.assertTrue(all(frame.dtype == np.float32 for frame in generated))

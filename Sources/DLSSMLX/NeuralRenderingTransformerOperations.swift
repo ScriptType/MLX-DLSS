@@ -736,9 +736,11 @@ struct NeuralRenderingGlobalStage {
     var value = input
     for block in blocks {
       value = block(value)
+      // Materialize each block to bound live attention intermediates, while
+      // allowing subsequent blocks to reuse their same-sized scratch buffers.
       eval(value)
-      Memory.clearCache()
     }
+    Memory.clearCache()
     return value
   }
 }
@@ -2191,8 +2193,9 @@ enum NeuralRenderingTransformerOperations {
       )
       eval(output)
       chunks.append(output)
-      Memory.clearCache()
     }
+    // Keep the per-chunk evaluation bound, but reuse scratch within this FFN.
+    Memory.clearCache()
     return concatenated(chunks, axis: 0).reshaped(input.shape)
   }
 

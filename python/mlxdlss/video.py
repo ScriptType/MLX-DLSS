@@ -10,7 +10,6 @@ import json
 import shutil
 import subprocess
 import sys
-import time
 from dataclasses import dataclass, field
 from fractions import Fraction
 from pathlib import Path
@@ -19,7 +18,7 @@ from typing import Any, Callable
 import numpy as np
 
 from .pipeline import NeuralRenderingPipeline
-from .temporal import BLEND_SCALE, TemporalOptions, TemporalSession
+from .temporal import BLEND_SCALE
 
 DEFAULT_ENCODE_ARGS = ["-c:v", "libx264", "-crf", "18", "-preset", "medium", "-pix_fmt", "yuv420p", "-movflags", "+faststart"]
 PIXEL_FORMATS = {"rgb24": (np.uint8, 255.0, 3), "rgb48le": ("<u2", 65535.0, 6)}
@@ -104,6 +103,7 @@ class ConvertOptions:
     mlxdlss: str | None = None
     execution: str = "metal-fused"
     precision: str = "float16"
+    prefetch: bool = True          # prepare one following temporal frame while the GPU renders
 
 
 @dataclass
@@ -137,158 +137,19 @@ def convert(
     ``progress(frames_done, frames_expected)`` is called after every encoded frame;
     ``should_stop()`` is polled once per decoded frame and ends the conversion early
     (the output is finalised with the frames written so far)."""
+    from .video_pipeline import NeuralRenderStage, run_video
+
     options = options or ConvertOptions()
     log = log or (lambda message: print(message, file=sys.stderr, flush=True))
-    source = Path(source); destination = Path(destination)
-    if destination.exists() and not options.overwrite:
-        raise VideoToolError(f"destination exists: {destination} (pass overwrite)")
-    if options.pixel_format not in PIXEL_FORMATS:
-        raise VideoToolError(f"pixel format must be one of {tuple(PIXEL_FORMATS)}")
-    if options.batch < 1:
-        raise VideoToolError("batch must be at least 1")
-    ffmpeg_tool = find_tool("ffmpeg", ffmpeg)
-    info = probe(source, ffprobe=ffprobe)
-    dtype, scale, bytes_per_pixel = PIXEL_FORMATS[options.pixel_format]
-    frame_bytes = info.width * info.height * bytes_per_pixel
-    decode = [ffmpeg_tool, "-hide_banner", "-loglevel", "error", "-nostdin", "-i", str(source), *options.decode_args]
-    if options.start_frame:
-        decode += ["-vf", f"select=gte(n\\,{options.start_frame})", "-fps_mode", "passthrough"]
-    if options.frame_limit is not None:
-        decode += ["-frames:v", str(options.frame_limit)]
-    decode += ["-an", "-f", "rawvideo", "-pix_fmt", options.pixel_format, "-"]
-    encode = [ffmpeg_tool, "-hide_banner", "-loglevel", "error", "-y", "-f", "rawvideo", "-pix_fmt", options.pixel_format,
-              "-s", f"{info.width}x{info.height}", "-r", str(info.frame_rate), "-i", "-"]
-    if options.audio == "copy" and info.has_audio:
-        encode += ["-i", str(source), "-map", "0:v:0", "-map", "1:a:0", "-c:a", "copy"]
-        if options.start_frame or options.frame_limit is not None:
-            encode += ["-shortest"]
-    else:
-        encode += ["-map", "0:v:0"]
-    encode += list(DEFAULT_ENCODE_ARGS if options.encode_args is None else options.encode_args)
-    encode += [str(destination)]
-    enhance = dict(options.enhance)
-    finish_keys = {"detail_strength", "colour_strength", "detail_radius", "intensity"}
-    finish_options = {k: v for k, v in enhance.items() if k in finish_keys}
-    prepare_options = {k: v for k, v in enhance.items() if k not in finish_keys}
-    expected = info.frame_count
-    if expected is not None:
-        expected = max(0, expected - options.start_frame)
-        if options.frame_limit is not None:
-            expected = min(expected, options.frame_limit)
-    session = None
-    stream = None
-    if options.backend == "mlxdlss":
-        from .mlxdlss_stream import MLXDLSSStreamSession
-
-        if not options.model_package:
-            raise VideoToolError("backend 'mlxdlss' needs --model MODEL.dlssmodel")
-        stream = MLXDLSSStreamSession(
-            options.model_package, info.width, info.height, temporal=options.temporal, motion=options.motion,
-            blend_scale=options.blend_scale, robust_motion=options.robust_motion,
-            scene_cut_threshold=options.scene_cut_threshold, mlxdlss=options.mlxdlss, profile=enhance.get("profile", "standard"),
-            intensity=enhance.get("intensity", 1.0), execution=options.execution, precision=options.precision,
-            processing_scale=enhance.get("processing_scale", 1.0), detail_strength=enhance.get("detail_strength", 1.0),
-            colour_strength=enhance.get("colour_strength", 1.0), detail_radius=enhance.get("detail_radius", 4.0),
-        )
-    elif options.temporal:
-        session = TemporalSession(
-            pipeline,
-            options=TemporalOptions(
-                processing_scale=enhance.get("processing_scale", 1.0), robust_motion=options.robust_motion,
-                profile=enhance.get("profile", "standard"), blend_scale=options.blend_scale, intensity=enhance.get("intensity", 1.0),
-                scene_cut_threshold=options.scene_cut_threshold, detail_strength=enhance.get("detail_strength", 1.0),
-                colour_strength=enhance.get("colour_strength", 1.0), detail_radius=enhance.get("detail_radius", 4.0),
-            ),
-            motion=options.motion,
-        )
-    log(f"MODE {'temporal' if options.temporal else 'independent'} motion={options.motion if options.temporal else 'none'} scale={enhance.get('processing_scale', 1.0):g}")
-    decoder = encoder = None
-    try:
-        decoder = subprocess.Popen(decode, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        encoder = subprocess.Popen(encode, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
-    except BaseException:
-        if decoder is not None:
-            decoder.kill(); decoder.wait()
-            decoder.stdout.close(); decoder.stderr.close()
-        if stream is not None:
-            stream.abort()
-        raise
-    started = time.perf_counter(); last_status = started; frames = 0
-    def emit_temporal(frame):
-        nonlocal frames
-        image = np.clip(stream.process_frame(frame) if stream is not None else session.process(frame), 0, 1) * scale + 0.5
-        encoder.stdin.write(np.ascontiguousarray(image.astype(dtype)).tobytes())
-        frames += 1
-        if progress is not None:
-            progress(frames, expected)
-
-    def emit(prepared_batch):
-        nonlocal frames
-        network_started = time.perf_counter()
-        heads = pipeline.run_features_batch(np.stack([p.features for p in prepared_batch]))
-        network_seconds = (time.perf_counter() - network_started) / len(prepared_batch)
-        for prepared, head in zip(prepared_batch, heads):
-            result = pipeline.finish(prepared, head, network_seconds=network_seconds, **finish_options)
-            image = np.clip(result.image, 0, 1) * scale + 0.5
-            encoder.stdin.write(np.ascontiguousarray(image.astype(dtype)).tobytes())
-            frames += 1
-            if progress is not None:
-                progress(frames, expected)
-    cancelled = False
-    try:
-        pending = []
-        while True:
-            if should_stop is not None and should_stop():
-                cancelled = True
-                break
-            chunk = decoder.stdout.read(frame_bytes)
-            if len(chunk) < frame_bytes:
-                break
-            frame = np.frombuffer(chunk, dtype=dtype).reshape(info.height, info.width, 3).astype(np.float32) / np.float32(scale)
-            if session is not None or stream is not None:
-                emit_temporal(frame)
-            else:
-                pending.append(pipeline.prepare(frame, frame_index=options.start_frame + frames + len(pending), **prepare_options))
-                if len(pending) >= options.batch:
-                    emit(pending); pending = []
-            now = time.perf_counter()
-            if now - last_status >= options.status_interval:
-                elapsed = now - started; rate = frames / elapsed if elapsed else 0.0
-                eta = f" eta {int((expected - frames) / rate)} s" if expected and rate else ""
-                log(f"STATUS {time.strftime('%H:%M:%S')} frames {frames}/{expected if expected is not None else '?'} {rate:.2f} fps{eta}")
-                last_status = now
-        if pending:
-            emit(pending)
-        if stream is not None:
-            stream.close()
-        encoder.stdin.close()
-        if cancelled and decoder.poll() is None:
-            decoder.kill()
-        decoder_error = decoder.stderr.read().decode(errors="replace").strip()
-        encoder_error = encoder.stderr.read().decode(errors="replace").strip()
-        decoder.wait(); encoder.wait()
-    finally:
-        if stream is not None:
-            stream.abort()
-        for process in (decoder, encoder):
-            if process.poll() is None:
-                process.kill()
-            process.wait()
-            for pipe in (process.stdin, process.stdout, process.stderr):
-                if pipe is not None:
-                    try:
-                        pipe.close()
-                    except OSError:
-                        pass
-    if decoder.returncode and not cancelled:
-        raise VideoToolError(f"ffmpeg decode failed: {decoder_error}")
-    if encoder.returncode:
-        raise VideoToolError(f"ffmpeg encode failed: {encoder_error}")
-    seconds = time.perf_counter() - started
-    cuts = session.scene_cuts if session is not None else (stream.scene_cuts if stream is not None else 0)
-    log(f"DONE frames {frames} in {seconds:.1f} s ({frames / seconds if seconds else 0:.2f} fps){f', scene cuts {cuts}' if options.temporal else ''} -> {destination}")
-    return ConvertResult(frames, seconds, info.width, info.height, info.fps, destination, cuts, options.temporal,
-                         options.motion if options.temporal else "none", enhance.get("processing_scale", 1.0))
+    stage = NeuralRenderStage(pipeline, options)
+    log(f"MODE {'temporal' if options.temporal else 'independent'} motion={options.motion if options.temporal else 'none'} scale={options.enhance.get('processing_scale', 1.0):g}")
+    info, _, frames, seconds, rate = run_video(
+        source, destination, [stage], options, ffmpeg=ffmpeg, ffprobe=ffprobe,
+        log=log, progress=progress, should_stop=should_stop,
+    )
+    return ConvertResult(frames, seconds, info.width, info.height, float(rate), Path(destination),
+                         stage.scene_cuts, options.temporal, options.motion if options.temporal else "none",
+                         options.enhance.get("processing_scale", 1.0))
 
 
 def compare_command(original: str | Path, processed: str | Path, *, player: str | None = None) -> list[str]:

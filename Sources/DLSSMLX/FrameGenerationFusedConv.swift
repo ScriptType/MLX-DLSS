@@ -84,7 +84,7 @@ enum FrameGenerationFusedConv {
   /// row for every output channel; each simdgroup owns 16 channels and accumulates
   /// 2x2 8x8 tiles over the 9 taps and the input channels in chunks of 8, so a weight
   /// tile is loaded once per 16 pixels instead of once per pixel. Input is the
-  /// zero-padded image `[H+3][W+2][cin]` (one border row/column plus a slack row).
+  /// zero-padded image with width rounded to 16 (one border plus a slack row).
   static let simdKernel = MLXFast.metalKernel(
     name: "mlxdlss_fg_conv3x3_sg",
     inputNames: ["input", "weight", "bias", "residual", "params"],
@@ -97,7 +97,7 @@ enum FrameGenerationFusedConv {
       const int cout = int(params[3]);
       const uint flags = params[4];
       const int batch = int(params[5]);
-      const int paddedWidth = width + 2;
+      const int paddedWidth = ((width + 15) / 16) * 16 + 2;
       const uint simdgroupsPerTile = uint(cout / 16);
       const uint sg = simdgroup_index_in_threadgroup;
       const uint lane = thread_index_in_simdgroup;
@@ -192,17 +192,34 @@ enum FrameGenerationFusedConv {
       eval(self.packed, self.rows, self.bias)
     }
 
-    var simdgroupCapable: Bool { cout % 16 == 0 && cin % 8 == 0 }
+    var simdgroupCapable: Bool { cout % 16 == 0 && cout <= 96 && cin % 8 == 0 }
   }
 
-  /// `MLXDLSS_FG_SIMD=0` keeps the per-pixel kernel for every layer (diagnostics).
-  nonisolated(unsafe) static var simdEnabled: Bool = ProcessInfo.processInfo.environment["MLXDLSS_FG_SIMD"] == "1"
+  /// `0` forces per-pixel convolution; `1` forces eligible SIMD layers.
+  /// Unset selects by the layer's work size, including its batch dimension.
+  nonisolated(unsafe) static var simdEnabled: Bool? = {
+    switch ProcessInfo.processInfo.environment["MLXDLSS_FG_SIMD"] {
+    case "0": false
+    case "1": true
+    default: nil
+    }
+  }()
+
+  static func useSIMD(_ x: MLXArray, _ layer: Layer, pool: Bool) -> Bool {
+    guard layer.simdgroupCapable else { return false }
+    if let simdEnabled { return simdEnabled }
+    // Pooled stems lose the one-launch epilogue on the SIMD path. Small
+    // convolutions also cost less than the extra padding dispatch on M2 Max.
+    return !pool && layer.cout >= 32 && x.dim(0) * x.dim(1) * x.dim(2) >= 16_384
+  }
 
   /// The simdgroup-matrix convolution (no pooling; `cout % 16 == 0`, `cin % 8 == 0`).
   static func applySimd(_ x: MLXArray, _ layer: Layer, activation: Bool, residual: MLXArray? = nil) -> MLXArray {
     let (n, h, w) = (x.dim(0), x.dim(1), x.dim(2))
     precondition(x.dim(3) == layer.cin && layer.simdgroupCapable)
-    let paddedInput = padded(x.asType(.float16), widths: [[0, 0], [1, 2], [1, 1], [0, 0]])
+    // Matrix loads cover the whole 16-pixel tile, including its masked tail.
+    let tail = (16 - w % 16) % 16
+    let paddedInput = padded(x.asType(.float16), widths: [[0, 0], [1, 2], [1, 1 + tail], [0, 0]])
     var flags: UInt32 = activation ? 1 : 0
     if residual != nil { flags |= 2 }
     let params = MLXArray([UInt32(h), UInt32(w), UInt32(layer.cin), UInt32(layer.cout), flags, UInt32(n)])
@@ -220,12 +237,15 @@ enum FrameGenerationFusedConv {
 
   /// `x` [N,H,W,cin] fp16 (cin == layer.cin) -> [N,H,W,cout] or [N,H/2,W/2,cout] with `pool`.
   static func apply(_ x: MLXArray, _ layer: Layer, activation: Bool, residual: MLXArray? = nil, pool: Bool = false) -> MLXArray {
-    if simdEnabled, layer.simdgroupCapable {
-      let y = applySimd(x, layer, activation: activation, residual: residual)
-      return pool ? FrameGenerator.meanPool2(y) : y
-    }
-    let (n, h, w) = (x.dim(0), x.dim(1), x.dim(2))
     precondition(x.dim(3) == layer.cin, "fused conv expects \(layer.cin) input channels, got \(x.dim(3))")
+    let (n, h, w) = (x.dim(0), x.dim(1), x.dim(2))
+    if pool && (h < 2 || w < 2) {
+      return MLXArray.zeros([n, h / 2, w / 2, layer.cout], dtype: .float16)
+    }
+    if useSIMD(x, layer, pool: pool) {
+      let y = applySimd(x, layer, activation: activation, residual: residual)
+      return pool ? FrameGenerator.meanPool2(y[0..., 0..<(h / 2 * 2), 0..<(w / 2 * 2), 0...]) : y
+    }
     let outH = pool ? h / 2 : h, outW = pool ? w / 2 : w
     var flags: UInt32 = activation ? 1 : 0
     if residual != nil { flags |= 2 }

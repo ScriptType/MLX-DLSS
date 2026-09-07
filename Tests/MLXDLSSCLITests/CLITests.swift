@@ -58,7 +58,7 @@ final class CLITests: XCTestCase {
 
   func testStreamRejectsUnknownProtocolAndNonfiniteBlendScaleBeforeOpeningModel() throws {
     for options in [
-      ["--protocol-version", "3"], ["--protocol-version", "x"], ["--blend-scale", "nan"],
+      ["--protocol-version", "4"], ["--protocol-version", "x"], ["--blend-scale", "nan"],
     ] {
       let result = try runCLI(
         ["stream", "/definitely/missing/model.dlssmodel", "--width", "1", "--height", "1"] + options
@@ -91,7 +91,7 @@ final class CLITests: XCTestCase {
   }
 
   func testStreamFrameDecoderPreservesLegacyLayoutsInBothVersions() throws {
-    for version in [1, 2] {
+    for version in [1, 2, 3] {
       for temporal in [false, true] {
         let values: [Float] = temporal ? [0.25, 0.5, 0.75, 0, 0, 1] : [0.25, 0.5, 0.75]
         try withInputPipe(streamPayload(flags: 1, values: values)) { handle in
@@ -116,7 +116,10 @@ final class CLITests: XCTestCase {
       (streamPayload(flags: 2, values: valid), true, 1),
       (streamPayload(flags: 4, values: valid), true, 2),
       (streamPayload(flags: 2, values: valid), false, 2),
-      (streamPayload(flags: 0, values: valid), true, 3),
+      (streamPayload(flags: 0, values: valid), true, 4),
+      (streamPayload(flags: 24, values: valid), true, 3),
+      (streamPayload(flags: 4, values: valid), false, 3),
+      (streamPayload(flags: 32, values: valid), true, 3),
       (Data([0, 0]), true, 2),
     ]
     for value: Float in [.nan, .infinity, -.infinity, -0.1, 1.1] {
@@ -138,6 +141,39 @@ final class CLITests: XCTestCase {
         XCTAssertThrowsError(
           try StreamCommand.readFrame(
             from: handle, width: 1, height: 1, temporal: temporal, protocolVersion: version))
+      }
+    }
+  }
+
+  func testCompactStreamDecodesExactIntegerColorAndConstantDepth() throws {
+    for bits in [8, 16] {
+      let values: [UInt16] = [0, 1, 127, 128, 254, 255]
+      let integers = bits == 8 ? values : [0, 1, 255, 256, 32768, 65535]
+      var payload = streamPayload(flags: UInt32(7 | (bits == 8 ? 8 : 16)), values: [])
+      if bits == 8 {
+        payload.append(contentsOf: integers.map { UInt8($0) })
+      } else {
+        payload.append(integers.map { $0.littleEndian }.withUnsafeBytes { Data($0) })
+      }
+      let guides: [Float] = [-0.25, 0.5, 0, 0, 0.125, 1]
+      payload.append(guides.withUnsafeBytes { Data($0) })
+      payload.append(streamPayload(flags: 4, values: [0.25, 0.5, 0.75, 1, 0, 0, 0, 0, 0, 0]))
+      try withInputPipe(payload) { handle in
+        let frame = try XCTUnwrap(StreamCommand.readFrame(
+          from: handle, width: 2, height: 1, temporal: true, protocolVersion: 3))
+        let expected = integers.map { Float($0) / (bits == 8 ? 255 : 65535) }
+        XCTAssertEqual(frame.inputs[0].bytes, expected.withUnsafeBytes { Data($0) })
+        XCTAssertEqual(frame.inputs.map { $0.descriptor.name }, ["color", "motion", "depth", "historyConfidence"])
+        XCTAssertEqual(frame.inputs[2].bytes, [Float(1), 1].withUnsafeBytes { Data($0) })
+        XCTAssertEqual(frame.inputs[3].bytes, [Float(0.125), 1].withUnsafeBytes { Data($0) })
+        XCTAssertNotNil(try StreamCommand.readFrame(from: handle, width: 2, height: 1, temporal: true, protocolVersion: 3))
+        XCTAssertNil(try StreamCommand.readFrame(from: handle, width: 2, height: 1, temporal: true, protocolVersion: 3))
+      }
+      for length in 4..<(4 + 6 * bits / 8 + guides.count * 4) {
+        try withInputPipe(Data(payload.prefix(length))) { handle in
+          XCTAssertThrowsError(try StreamCommand.readFrame(
+            from: handle, width: 2, height: 1, temporal: true, protocolVersion: 3))
+        }
       }
     }
   }
