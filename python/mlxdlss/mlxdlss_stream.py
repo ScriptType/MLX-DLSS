@@ -3,7 +3,8 @@
 Protocol (per frame): little-endian uint32 flags (bit 0 = reset history), then
 float32 colour (H, W, 3); in temporal mode also motion (H, W, 2) as normalised
 history-UV offsets and depth (H, W, 1). One float32 RGB frame comes back per
-input frame.
+input frame. Protocol 2 adds flag bit 1 for an optional float32 H×W×1 history
+confidence plane after depth; the temporal adapter explicitly requests it.
 """
 from __future__ import annotations
 
@@ -11,13 +12,14 @@ import json
 import shutil
 import struct
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Callable
 
 import numpy as np
 
-from .composition import compose_detail
-from .temporal import FlowMotionEstimator, zero_motion
+from .composition import compose_detail, resample
+from .temporal import BLEND_SCALE, FlowMotionEstimator, zero_motion, resolve_motion, resize_guide
 
 RESET_FLAG = 1
 
@@ -35,110 +37,155 @@ def find_mlxdlss(explicit: str | None = None) -> str:
 
 
 class MLXDLSSStreamSession:
-    """Frame-sequence processor backed by the Swift Metal runtime (macOS, Apple Silicon)."""
+    """Sequential Metal renderer; source-size frames, processing-size history."""
 
-    def __init__(
-        self,
-        model_package: str | Path,
-        width: int,
-        height: int,
-        *,
-        temporal: bool = True,
-        motion: Callable | str = "flow",
-        scene_cut_threshold: float = 0.3,
-        mlxdlss: str | None = None,
-        profile: str = "standard",
-        intensity: float = 1.0,
-        execution: str = "metal-fused",
-        precision: str = "float16",
-        processing_scale: float = 1.0,
-        detail_strength: float = 1.0,
-        colour_strength: float = 1.0,
-        detail_radius: float = 4.0,
-    ):
+    def __init__(self, model_package: str | Path, width: int, height: int, *, temporal: bool = True,
+                 motion: Callable | str = "flow", scene_cut_threshold: float = 0.3, mlxdlss: str | None = None,
+                 profile: str = "standard", intensity: float = 1.0, execution: str = "metal-fused",
+                 precision: str = "float16", processing_scale: float = 1.0, detail_strength: float = 1.0,
+                 colour_strength: float = 1.0, detail_radius: float = 4.0, blend_scale: float = BLEND_SCALE,
+                 robust_motion: bool = True):
+        if not 1 <= processing_scale <= 4:
+            raise ValueError("processing_scale must be within [1, 4]")
+        if width <= 0 or height <= 0:
+            raise ValueError("frame dimensions must be positive")
         self.width, self.height, self.temporal = width, height, temporal
+        self.processing_width = round(width * processing_scale) if temporal else width
+        self.processing_height = round(height * processing_scale) if temporal else height
         self.scene_cut_threshold = scene_cut_threshold
+        self.robust_motion = robust_motion
         self.detail = (detail_strength, colour_strength, detail_radius)
-        if not temporal:
+        if not temporal or motion == "zero":
             self.motion = zero_motion
         elif motion == "flow":
             self.motion = FlowMotionEstimator()
-        elif motion == "zero":
-            self.motion = zero_motion
         elif callable(motion):
             self.motion = motion
         else:
             raise ValueError("motion must be 'flow', 'zero' or a callable")
-        command = [
-            find_mlxdlss(mlxdlss), "stream", str(model_package), "--width", str(width), "--height", str(height),
-            "--mode", "temporal" if temporal else "first-frame", "--execution", execution, "--precision", precision,
-            "--profile", profile, "--intensity", str(intensity),
-        ]
-        if not temporal:
-            # the recipe is applied by the Swift side in first-frame mode (resampling included)
+        command = [find_mlxdlss(mlxdlss), "stream", str(model_package),
+                   "--width", str(self.processing_width), "--height", str(self.processing_height),
+                   "--mode", "temporal" if temporal else "first-frame", "--execution", execution,
+                   "--precision", precision, "--profile", profile, "--intensity", str(intensity)]
+        if temporal:
+            command += ["--protocol-version", "2", "--blend-scale", str(blend_scale)]
+        else:
             command += ["--processing-scale", str(processing_scale), "--detail-strength", str(detail_strength),
                         "--colour-strength", str(colour_strength), "--detail-radius", str(detail_radius)]
-        self.process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self._stderr = tempfile.TemporaryFile()
+        try:
+            self.process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self._stderr)
+        except BaseException:
+            self._stderr.close()
+            raise
         self.previous: np.ndarray | None = None
+        self.frame_index = self.scene_cuts = self.frames = 0
+        self._reset_pending = False
+        self._closed = False
+        self._summary = {}
+        self._depth = np.ones((self.processing_height, self.processing_width, 1), dtype="<f4").tobytes()
+
+    def reset(self):
+        self.previous = None
         self.frame_index = 0
-        self.scene_cuts = 0
-        self.frames = 0
-        self._depth = np.ones((height, width, 1), dtype="<f4").tobytes()
+        self._reset_pending = True
 
-    def _is_scene_cut(self, frame: np.ndarray) -> bool:
-        if self.previous is None or self.scene_cut_threshold <= 0:
-            return False
-        luma = lambda f: f[..., 0] * 0.2126 + f[..., 1] * 0.7152 + f[..., 2] * 0.0722
-        return float(np.abs(luma(frame) - luma(self.previous)).mean()) > self.scene_cut_threshold
+    def _error_text(self):
+        self._stderr.seek(0)
+        return self._stderr.read().decode(errors="replace")[-1000:]
 
-    def process_frame(self, frame: np.ndarray, *, motion: np.ndarray | None = None) -> np.ndarray:
+    def process_frame(self, frame: np.ndarray, *, motion: np.ndarray | None = None,
+                      history_confidence: np.ndarray | None = None) -> np.ndarray:
+        if self._closed:
+            raise RuntimeError("mlxdlss stream is closed")
         frame = np.asarray(frame, dtype=np.float32)
-        if frame.shape != (self.height, self.width, 3):
-            raise ValueError(f"frame must be ({self.height}, {self.width}, 3)")
-        flags = 0
-        if self._is_scene_cut(frame):
-            flags |= RESET_FLAG; self.scene_cuts += 1; self.frame_index = 0
-        payload = [struct.pack("<I", flags), np.ascontiguousarray(frame.astype("<f4")).tobytes()]
+        if frame.shape != (self.height, self.width, 3) or not np.isfinite(frame).all():
+            raise ValueError(f"frame must be finite ({self.height}, {self.width}, 3)")
+        if not self.temporal and history_confidence is not None:
+            raise ValueError("history confidence requires temporal mode")
+        estimate = resolve_motion(self.motion, frame, self.previous, motion, history_confidence,
+                                  scene_cut_threshold=self.scene_cut_threshold, robust_motion=self.robust_motion)
+        flags = RESET_FLAG if self._reset_pending or estimate.reset else 0
+        if estimate.reset:
+            self.scene_cuts += 1
+        width, height = self.processing_width, self.processing_height
+        processing = resample(frame, width, height) if self.temporal else frame
+        confidence = estimate.confidence if self.temporal else None
+        if confidence is not None:
+            confidence = resize_guide(confidence, width, height, confidence=True)
+            flags |= 2
+        payload = [struct.pack("<I", flags), np.ascontiguousarray(processing, dtype="<f4").tobytes()]
         if self.temporal:
-            if motion is None:
-                motion = zero_motion(frame, frame) if (self.previous is None or flags & RESET_FLAG) else self.motion(frame, self.previous)
-            payload += [np.ascontiguousarray(np.asarray(motion, dtype="<f4")).tobytes(), self._depth]
+            mv = resize_guide(estimate.motion_uv, width, height)
+            payload += [np.ascontiguousarray(mv, dtype="<f4").tobytes(), self._depth]
+            if confidence is not None:
+                payload.append(np.ascontiguousarray(confidence, dtype="<f4").tobytes())
         try:
             self.process.stdin.write(b"".join(payload)); self.process.stdin.flush()
-            expected = self.height * self.width * 3 * 4
+            expected = height * width * 3 * 4
             data = bytearray()
             while len(data) < expected:
                 chunk = self.process.stdout.read(expected - len(data))
                 if not chunk:
-                    raise RuntimeError(f"mlxdlss stream ended early: {self.process.stderr.read().decode(errors='replace')[-500:]}")
+                    raise RuntimeError(f"mlxdlss stream ended early (rebuild the binary if its protocol is outdated): {self._error_text()}")
                 data += chunk
-        except BrokenPipeError as error:
-            raise RuntimeError(f"mlxdlss stream failed: {self.process.stderr.read().decode(errors='replace')[-500:]}") from error
-        output = np.frombuffer(bytes(data), dtype="<f4").reshape(self.height, self.width, 3)
-        self.previous = frame; self.frame_index += 1; self.frames += 1
+        except (BrokenPipeError, OSError) as error:
+            detail = self._error_text()
+            self.abort()
+            raise RuntimeError(f"mlxdlss stream failed (rebuild the binary if its protocol is outdated): {detail}") from error
+        except BaseException:
+            self.abort()
+            raise
+        output = np.frombuffer(bytes(data), dtype="<f4").reshape(height, width, 3)
+        self.previous = frame.copy()
+        self.frame_index = 1 if flags & RESET_FLAG else self.frame_index + 1
+        self.frames += 1
+        self._reset_pending = False
         if self.temporal:
             detail, colour, radius = self.detail
-            output = compose_detail(frame, output, detail_strength=detail, colour_strength=colour, radius=radius)
+            output = compose_detail(frame, resample(output, self.width, self.height),
+                                    detail_strength=detail, colour_strength=colour, radius=radius)
         return output
 
+    def abort(self):
+        if self._closed:
+            return
+        if self.process.poll() is None:
+            self.process.kill()
+        self.process.wait()
+        self._release()
+
+    def _release(self):
+        for pipe in (self.process.stdin, self.process.stdout):
+            if pipe is not None:
+                try:
+                    pipe.close()
+                except OSError:
+                    pass
+        self._stderr.close()
+        self._closed = True
+
     def close(self) -> dict:
-        if self.process.stdin:
+        if self._closed:
+            return self._summary
+        try:
             try:
                 self.process.stdin.close()
             except BrokenPipeError:
                 pass
-        stderr = self.process.stderr.read().decode(errors="replace")
-        self.process.wait()
-        summary = {}
-        for line in stderr.strip().split("\n"):
-            if line.startswith("{"):
-                try:
-                    summary = json.loads(line)
-                except json.JSONDecodeError:
-                    pass
-        if self.process.returncode:
-            raise RuntimeError(f"mlxdlss stream exited with {self.process.returncode}: {stderr[-500:]}")
-        return summary
+            self.process.wait(timeout=30)
+            stderr = self._error_text()
+            if self.process.returncode:
+                raise RuntimeError(f"mlxdlss stream exited with {self.process.returncode}: {stderr}")
+            for line in stderr.splitlines():
+                if line.startswith("{"):
+                    try:
+                        self._summary = json.loads(line)
+                    except json.JSONDecodeError:
+                        pass
+            return self._summary
+        finally:
+            self.abort()
 
 
 class MLXDLSSFrameGenStream:

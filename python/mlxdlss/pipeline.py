@@ -239,10 +239,9 @@ class PreparedFrame:
 class NeuralRenderingSession:
     """Frame-sequence wrapper: advances the noise frame index per frame.
 
-    Temporal accumulation (motion vectors, depth, history) is the next phase;
-    this class is the stable entry point for it, so callers can already feed
-    frames through ``process`` and later gain temporal consistency without an
-    API change.
+    Frames are independent and ``process`` returns ``EnhanceResult``.
+    Use ``TemporalSession`` for motion-compensated rendered history; its
+    ``process`` method returns an RGB ndarray.
     """
 
     def __init__(self, pipeline: NeuralRenderingPipeline, **enhance_options: Any):

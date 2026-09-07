@@ -39,6 +39,7 @@ class Job:
     started: float | None = None
     finished: float | None = None
     backend: str = ""
+    diagnostics: dict = field(default_factory=dict)
 
     @property
     def seconds(self) -> float | None:
@@ -79,7 +80,7 @@ class JobStore:
 
     def create(self, input_name: str, effects_raw, *, data: bytes | None = None, source: Path | None = None) -> Job:
         kind = media_kind(input_name)
-        effects = parse_effects(effects_raw)
+        effects = parse_effects(effects_raw, kind=kind)
         validate_chain(effects, kind)
         job_id = time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
         folder = self.folder(job_id)

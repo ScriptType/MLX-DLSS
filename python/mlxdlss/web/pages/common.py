@@ -85,7 +85,7 @@ def effect_editor(kind: str, initial: list[dict] | None = None) -> Callable[[], 
             intensity = ds.slider_row("Intensity", value=float(nr0.get("intensity", 1.0)), minimum=0.0, maximum=2.0, step=0.1)
             temporal = None
             if kind == "video":
-                temporal = ds.switch_row("Temporal", "Reproject the previous output into the next frame and blend it (native scale only).", value=bool(nr0.get("temporal", False)))
+                temporal = ds.switch_row("Temporal", "Keep generated detail stable using motion and reliable history.", value=bool(nr0.get("temporal", not initial)))
     fg_enabled = fg_mode = fg_factor = fg_audio = order = None
     if kind == "video":
         with ds.card("Frame generation") as box:

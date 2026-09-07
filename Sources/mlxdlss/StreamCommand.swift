@@ -11,15 +11,16 @@ import DLSSMLX
 /// Per frame: a little-endian UInt32 flag word (bit 0: reset the history
 /// before this frame), then `H*W*3` colour floats, and in temporal mode
 /// `H*W*2` normalised history-UV motion floats and `H*W*1` depth floats.
+/// Protocol 2 adds bit 1 for an optional confidence plane after depth.
 /// End of input ends the stream.
 enum StreamCommand {
   static let resetFlag: UInt32 = 1
+  static let confidenceFlag: UInt32 = 2
 
   static func run(arguments: [String]) async throws {
     let parsed = try parse(arguments: arguments)
     let width = parsed.width
     let height = parsed.height
-    let pixelCount = width * height
     let head = try MLXNeuralRenderer(
       packageURL: parsed.modelURL,
       executionMode: parsed.executionMode,
@@ -35,6 +36,7 @@ enum StreamCommand {
         historyTransform: nil,
         motionTransform: nil,
         controlMaskIntensity: parsed.options.intensity,
+        blendScale: parsed.blendScale,
         featureControls: parsed.options.featureControls,
         geometry: parsed.options.geometry
       )
@@ -46,28 +48,22 @@ enum StreamCommand {
     var frames = 0
     let clock = ContinuousClock()
     let started = clock.now
-    while let flags = try readWord(from: input) {
-      guard let colorData = try readExactly(pixelCount * 3 * 4, from: input) else {
-        throw CLIError.usage("stream: truncated colour frame \(frames)")
-      }
-      let color = try tensor(named: "color", data: colorData, height: height, width: width, channels: 3)
+    while let frame = try readFrame(
+      from: input, width: width, height: height,
+      temporal: parsed.mode == .temporal, protocolVersion: parsed.protocolVersion
+    ) {
+      let flags = frame.flags
+      let color = frame.inputs[0]
       if flags & resetFlag != 0, frameIndex > 0 {
         streamID += 1
         frameIndex = 0
       }
       let rendered: HostTensor
       if let temporal {
-        guard let motionData = try readExactly(pixelCount * 2 * 4, from: input),
-          let depthData = try readExactly(pixelCount * 4, from: input)
-        else {
-          throw CLIError.usage("stream: truncated motion or depth frame \(frames)")
-        }
-        let motion = try tensor(named: "motion", data: motionData, height: height, width: width, channels: 2)
-        let depth = try tensor(named: "depth", data: depthData, height: height, width: width, channels: 1)
         let request = try NeuralRenderRequest(
           sequenceID: frameIndex,
           temporalContext: NeuralRenderFrameContext(streamID: streamID, frameIndex: frameIndex),
-          inputs: [color, motion, depth]
+          inputs: frame.inputs
         )
         guard let result = try await temporal.render(request).output(named: "color") else {
           throw CLIError.missingOutput("color")
@@ -99,6 +95,35 @@ enum StreamCommand {
     FileHandle.standardError.write(Data("\n".utf8))
   }
 
+  /// Decode and validate a whole frame before the renderer can consume it.
+  static func readFrame(
+    from handle: FileHandle, width: Int, height: Int,
+    temporal: Bool, protocolVersion: Int
+  ) throws -> (flags: UInt32, inputs: [HostTensor])? {
+    guard protocolVersion == 1 || protocolVersion == 2 else {
+      throw CLIError.usage("stream --protocol-version must be 1 or 2")
+    }
+    guard let flags = try readWord(from: handle) else { return nil }
+    let knownFlags = protocolVersion == 2 ? resetFlag | confidenceFlag : resetFlag
+    guard flags & ~knownFlags == 0 else {
+      throw CLIError.usage("stream: unknown frame flags for protocol version \(protocolVersion)")
+    }
+    let hasConfidence = flags & confidenceFlag != 0
+    guard temporal || !hasConfidence else {
+      throw CLIError.usage("stream: history confidence requires temporal mode")
+    }
+    var fields: [(String, Int)] = [("color", 3)]
+    if temporal { fields += [("motion", 2), ("depth", 1)] }
+    if hasConfidence { fields.append(("historyConfidence", 1)) }
+    let inputs = try fields.map { name, channels in
+      guard let data = try readExactly(width * height * channels * 4, from: handle) else {
+        throw CLIError.usage("stream: truncated \(name) frame")
+      }
+      return try tensor(named: name, data: data, height: height, width: width, channels: channels)
+    }
+    return (flags, inputs)
+  }
+
   private static func readWord(from handle: FileHandle) throws -> UInt32? {
     guard let data = try readExactly(4, from: handle) else { return nil }
     return data.withUnsafeBytes { $0.loadUnaligned(as: UInt32.self) }.littleEndian
@@ -120,7 +145,14 @@ enum StreamCommand {
   }
 
   private static func tensor(named name: String, data: Data, height: Int, width: Int, channels: Int) throws -> HostTensor {
-    try HostTensor(
+    let valid = data.withUnsafeBytes { bytes in
+      stride(from: 0, to: bytes.count, by: 4).allSatisfy { offset in
+        let value = bytes.loadUnaligned(fromByteOffset: offset, as: Float.self)
+        return value.isFinite && (name != "historyConfidence" || (value >= 0 && value <= 1))
+      }
+    }
+    guard valid else { throw CLIError.usage("stream: invalid \(name) values; expected finite values" + (name == "historyConfidence" ? " in [0, 1]" : "")) }
+    return try HostTensor(
       descriptor: TensorDescriptor(name: name, shape: [1, height, width, channels], dataType: .float32, layout: .nhwc),
       bytes: data
     )
@@ -139,6 +171,8 @@ enum StreamCommand {
     let executionMode: MLXExecutionMode
     let computePrecision: MLXComputePrecision
     let depthInverted: Bool
+    let protocolVersion: Int
+    let blendScale: Float
     let options: FirstFrameOptions
   }
 
@@ -150,7 +184,7 @@ enum StreamCommand {
       "--width", "--height", "--mode", "--execution", "--precision", "--profile", "--style-index",
       "--local-tone", "--local-structure", "--skin-structure", "--auto-mask", "--intensity",
       "--network-geometry", "--depth-inverted", "--processing-scale", "--detail-strength",
-      "--colour-strength", "--detail-radius",
+      "--colour-strength", "--detail-radius", "--blend-scale", "--protocol-version",
     ]
     var values: [String: String] = [:]
     var index = 1
@@ -167,6 +201,10 @@ enum StreamCommand {
     else {
       throw CLIError.usage("stream requires positive --width and --height")
     }
+    guard let protocolVersion = Int(values["--protocol-version"] ?? "1"), [1, 2].contains(protocolVersion) else {
+      throw CLIError.usage("stream --protocol-version must be 1 or 2")
+    }
+    let blendScale = try floatOption("--blend-scale", values: values, default: 0.739_746_093_75)
     let mode = try enumeration(Mode.self, values["--mode"], default: .temporal, message: "stream mode must be 'temporal' or 'first-frame'")
     let executionMode = try enumeration(
       MLXExecutionMode.self, values["--execution"], default: .metalFused,
@@ -238,7 +276,7 @@ enum StreamCommand {
     )
     return ParsedStream(
       modelURL: URL(fileURLWithPath: modelPath), width: width, height: height, mode: mode,
-      executionMode: executionMode, computePrecision: computePrecision, depthInverted: depthInverted, options: options
+      executionMode: executionMode, computePrecision: computePrecision, depthInverted: depthInverted, protocolVersion: protocolVersion, blendScale: blendScale, options: options
     )
   }
 

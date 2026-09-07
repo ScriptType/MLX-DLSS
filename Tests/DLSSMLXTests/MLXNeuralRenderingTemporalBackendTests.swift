@@ -8,6 +8,157 @@ import XCTest
 final class MLXNeuralRenderingTemporalBackendTests: XCTestCase {
   private let deviceFeatureDisplayTolerance: Float = 0.000_2
 
+  func testConfidenceFeaturesMatchAnalyticalTranslationForFusedAndPaddedPaths() throws {
+    let width = 5
+    let height = 3
+    let count = width * height
+    let currentValues = (0..<count * 3).map { Float(($0 * 7) % 31) / 32 }
+    let historyValues = (0..<count * 3).map { Float(($0 * 11) % 29) / 32 }
+    let current = try smallTensor(
+      name: "color", channels: 3, width: width, height: height, values: currentValues)
+    let history = try smallTensor(
+      name: "history", channels: 3, width: width, height: height, values: historyValues)
+    let motion = MLXArray(
+      Array(repeating: [Float(-1) / Float(width), 0], count: count).flatMap { $0 },
+      [1, height, width, 2])
+    let depth = MLXArray.ones([1, height, width, 1])
+    let processor = MLXTemporalFeatureProcessor()
+    let geometry = try NeuralRenderingNetworkGeometryPolicy.vendorAligned.resolve(
+      outputWidth: width, outputHeight: height)
+    let paddedBase = try NeuralRenderingFirstFramePreprocessor.makeFeatureTensor(
+      from: current, noiseFrameIndex: 3, geometry: geometry)
+    let logicalBase = array(paddedBase)[0..., 0..<height, 0..<width, 0...]
+    func scaled(_ value: Float) -> Float {
+      Float(Float16(Float(Float16(Float(Float16(value)) - 0.5)) * 0.125))
+    }
+    for mask in [
+      Array(repeating: Float(0), count: count), Array(repeating: Float(1), count: count),
+      Array(repeating: Float(0.375), count: count),
+      (0..<count).map { [Float(0), 1, 0.375][$0 % 3] },
+    ] {
+      let confidence = MLXArray(mask, [1, height, width, 1])
+      let fused = processor(
+        color: array(current), noiseFrameIndex: 3, history: array(history), motion: motion,
+        depth: depth, depthInverted: false, historyConfidence: confidence)
+      let padded = processor(
+        baseFeatures: logicalBase, history: array(history), motion: motion, depth: depth,
+        depthInverted: false, historyConfidence: confidence)
+      eval(fused, padded)
+      for actual in [fused.asArray(Float.self), padded.asArray(Float.self)] {
+        for pixel in 0..<count {
+          let previousPixel = pixel / width * width + max(0, pixel % width - 1)
+          for channel in 0..<3 {
+            let currentFeature = scaled(currentValues[pixel * 3 + channel])
+            let previousFeature = scaled(historyValues[previousPixel * 3 + channel])
+            let c = mask[pixel]
+            let expected =
+              c == 0
+              ? currentFeature
+              : c == 1 ? previousFeature : currentFeature + c * (previousFeature - currentFeature)
+            if c == 0 || c == 1 {
+              XCTAssertEqual(actual[pixel * 16 + 7 + channel], expected)
+            } else {
+              XCTAssertEqual(actual[pixel * 16 + 7 + channel], expected, accuracy: 0.000_001)
+            }
+          }
+        }
+      }
+    }
+  }
+
+  func testConfidenceFullMaskMatchesOmittedMaskExactly() throws {
+    let currentRequest = try request(frameIndex: 1, phase: 31)
+    let current = array(currentRequest.input(named: "color")!)
+    let history = array(try request(frameIndex: 0, phase: 0).input(named: "color")!)
+    let motion = array(currentRequest.input(named: "motion")!)
+    let depth = array(currentRequest.input(named: "depth")!)
+    let confidence = MLXArray.ones([1, 128, 128, 1])
+    let processor = MLXTemporalFeatureProcessor()
+    let omitted = processor(
+      color: current, noiseFrameIndex: 1, history: history, motion: motion, depth: depth,
+      depthInverted: false)
+    let full = processor(
+      color: current, noiseFrameIndex: 1, history: history, motion: motion, depth: depth,
+      depthInverted: false, historyConfidence: confidence)
+    eval(omitted, full)
+    XCTAssertEqual(full.asArray(Float.self), omitted.asArray(Float.self))
+    let head = MLXArray.zeros([1, 128, 128, 4])
+    let postprocessor = MLXTemporalPostprocessor()
+    let omittedOutput = postprocessor(
+      head: head, currentColor: current, features: omitted, hasHistory: true)
+    let fullOutput = postprocessor(
+      head: head, currentColor: current, features: full, hasHistory: true,
+      historyConfidence: confidence)
+    eval(omittedOutput, fullOutput)
+    XCTAssertEqual(fullOutput.asArray(Float.self), omittedOutput.asArray(Float.self))
+  }
+
+  func testDeviceBackendRejectsConfidenceShapeAndValuesBeforeRendering() async throws {
+    guard let packagePath = ProcessInfo.processInfo.environment["MLXDLSS_NEURAL_RENDERING_PACKAGE"]
+    else {
+      throw XCTSkip("set MLXDLSS_NEURAL_RENDERING_PACKAGE to run confidence request validation")
+    }
+    let device = try MLXNeuralRenderingDeviceTemporalBackend(
+      packageURL: URL(fileURLWithPath: packagePath))
+    let frame = try request(frameIndex: 0, phase: 0)
+    let inputs = [
+      frame.input(named: "color")!, frame.input(named: "motion")!, frame.input(named: "depth")!,
+    ]
+    let malformed = [
+      try smallTensor(name: "historyConfidence", channels: 1, width: 1, height: 1, values: [1]),
+      try tensor(
+        name: "historyConfidence", channels: 2, values: Array(repeating: 1, count: 128 * 128 * 2)),
+      try tensor(
+        name: "historyConfidence", channels: 1, values: Array(repeating: .nan, count: 128 * 128)),
+    ]
+    for confidence in malformed {
+      do {
+        _ = try await device.render(
+          NeuralRenderRequest(
+            sequenceID: 0, temporalContext: frame.temporalContext, inputs: inputs + [confidence]))
+        XCTFail("expected malformed confidence rejection")
+      } catch {
+        XCTAssertTrue(
+          error is NeuralRenderingTemporalPreprocessorError || error is MLXTemporalConfidenceError)
+      }
+    }
+  }
+
+  func testConfidenceValueValidationRejectsMalformedMaps() throws {
+    for value: Float in [.nan, .infinity, -.infinity, -0.001, 1.001] {
+      let tensor = try smallTensor(
+        name: "historyConfidence", channels: 1, width: 1, height: 1, values: [value])
+      XCTAssertThrowsError(try validateHistoryConfidenceValues(tensor)) { error in
+        XCTAssertEqual(error as? MLXTemporalConfidenceError, .invalidValues)
+      }
+    }
+    let valid = try smallTensor(
+      name: "historyConfidence", channels: 1, width: 3, height: 1, values: [0, 0.375, 1])
+    XCTAssertNoThrow(try validateHistoryConfidenceValues(valid))
+  }
+
+  func testConfidencePostprocessorHasIndependentBlendScaleAndMaskExpectation() throws {
+    let current = MLXArray([Float(0.25), 0.5, 0.75], [1, 1, 1, 3])
+    let head = MLXArray([Float(0.5), -0.5, 0.25, 0], [1, 1, 1, 4])
+    var features = [Float](repeating: 0, count: 16)
+    features[7] = 0.0625
+    features[8] = -0.0625
+    features[9] = 0
+    for scale: Float in [0.5, 0.739_746_093_75] {
+      for c: Float in [0, 0.375, 1] {
+        let output = MLXTemporalPostprocessor(blendScale: scale)(
+          head: head, currentColor: current, features: MLXArray(features, [1, 1, 1, 16]),
+          hasHistory: true, historyConfidence: MLXArray([c], [1, 1, 1, 1]))
+        eval(output)
+        let predictions: [Float] = [0.375, 0.375, 0.8125]
+        let history: [Float] = [1, 0, 0.5]
+        let alpha = 0.5 * Float(Float16(scale)) * c
+        let expected = zip(predictions, history).map { $0 + alpha * ($1 - $0) }
+        XCTAssertEqual(output.asArray(Float.self), expected)
+      }
+    }
+  }
+
   func testDeviceBaseFeatureKernelMatchesPortableFeatureContract() throws {
     let color = try smallTensor(
       name: "color",

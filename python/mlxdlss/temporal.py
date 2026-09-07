@@ -14,7 +14,8 @@ from typing import Callable
 
 import numpy as np
 
-from .composition import compose_detail, compose_head
+from .composition import compose_detail, compose_head, resample
+from .motion_quality import MotionEstimate, assess_motion, luma, validate_map
 from .features import PROFILES, AutomaticMask, NetworkGeometry, deterministic_noise, half, make_features, scaled_color
 
 BLEND_SCALE = 0.73974609375  # half(blend_scale) of the recovered package
@@ -110,6 +111,7 @@ def make_temporal_features(
     motion: np.ndarray,
     *,
     frame_index: int,
+    history_confidence: np.ndarray | None = None,
     depth: np.ndarray | None = None,
     depth_guide: str = "observed",
     depth_inverted: bool = False,
@@ -124,8 +126,7 @@ def make_temporal_features(
     height, width = color.shape[:2]
     if history.shape != color.shape:
         raise ValueError("history must match the colour shape")
-    if motion.shape != (height, width, 2):
-        raise ValueError("motion must be (height, width, 2)")
+    motion = validate_map(motion, height, width, 2, "motion")
     features = make_features(
         color, frame_index=frame_index, normalized_style=normalized_style, local_tone_strength=local_tone_strength,
         local_structure_strength=local_structure_strength, automatic_mask=automatic_mask, control_mask=control_mask,
@@ -143,6 +144,12 @@ def make_temporal_features(
     u = (xx.astype(np.float32) + np.float32(0.5)) / np.float32(width) + sampled_motion[..., 0]
     v = (yy.astype(np.float32) + np.float32(0.5)) / np.float32(height) + sampled_motion[..., 1]
     features[..., 7:10] = scaled_color(sample_history(history, u, v))
+    if history_confidence is not None:
+        c = validate_map(history_confidence, height, width, 1, "history confidence", unit_interval=True)
+        current = features[..., 4:7]
+        reprojected = features[..., 7:10]
+        mixed = current + c * (reprojected - current)
+        features[..., 7:10] = np.where(c == 0, current, np.where(c == 1, reprojected, mixed))
     return features
 
 
@@ -164,6 +171,7 @@ def compose_temporal(
     features: np.ndarray,
     *,
     blend_scale: float = BLEND_SCALE,
+    history_confidence: np.ndarray | None = None,
     control_mask: np.ndarray | None = None,
     intensity: float = 1.0,
 ) -> np.ndarray:
@@ -173,6 +181,8 @@ def compose_temporal(
         raise ValueError("head, colour and features must share height and width; features need 16 channels")
     logit = half(head[..., 3:4])
     alpha = np.clip(1 / (1 + np.exp(-logit)) * half(blend_scale), 0, 1)
+    if history_confidence is not None:
+        alpha *= validate_map(history_confidence, *color.shape[:2], 1, "history confidence", unit_interval=True)
     predicted = np.clip(color + half(head[..., :3]) * np.float32(0.25), 0, 1)
     history = features[..., 7:10] * np.float32(8) + np.float32(0.5)
     temporal = predicted + alpha * (history - predicted)
@@ -205,6 +215,41 @@ class FlowMotionEstimator:
         height, width = current.shape[:2]
         return normalize_pixel_motion(flow, scale_x=1, scale_y=1, effective_width=width, effective_height=height)
 
+    def estimate(self, current, previous, *, scene_cut_threshold=0.3) -> MotionEstimate:
+        return assess_motion(current, previous, self(current, previous), self(previous, current),
+                             scene_cut_threshold=scene_cut_threshold)
+
+
+def resize_guide(guide: np.ndarray, width: int, height: int, *, confidence=False) -> np.ndarray:
+    """Resize a guide's spatial grid; normalized UV values retain their units."""
+    if guide.shape[:2] == (height, width):
+        return guide
+    from PIL import Image
+
+    interpolation = Image.Resampling.NEAREST if confidence else Image.Resampling.BILINEAR
+    return np.stack([np.asarray(Image.fromarray(guide[..., c]).resize((width, height), interpolation), np.float32)
+                     for c in range(guide.shape[2])], axis=-1)
+
+
+def resolve_motion(estimator, current, previous, motion, confidence, *, scene_cut_threshold, robust_motion=True) -> MotionEstimate:
+    height, width = current.shape[:2]
+    if motion is not None:
+        motion = validate_map(motion, height, width, 2, "motion")
+    if confidence is not None:
+        confidence = validate_map(confidence, height, width, 1, "history confidence", unit_interval=True)
+    if previous is None:
+        return MotionEstimate(zero_motion(current, current) if motion is None else motion, confidence, False)
+    if motion is None and isinstance(estimator, FlowMotionEstimator) and robust_motion:
+        estimate = estimator.estimate(current, previous, scene_cut_threshold=scene_cut_threshold)
+        if confidence is not None:
+            estimate.confidence = estimate.confidence * confidence
+        return estimate
+    cut = scene_cut_threshold > 0 and float(np.abs(luma(current) - luma(previous)).mean()) > scene_cut_threshold
+    if motion is None:
+        motion = zero_motion(current, previous) if cut else estimator(current, previous)
+    motion = validate_map(motion, height, width, 2, "motion")
+    return MotionEstimate(motion, confidence, cut, "luma change" if cut else None)
+
 
 def zero_motion(current: np.ndarray, previous: np.ndarray) -> np.ndarray:
     return np.zeros((*current.shape[:2], 2), dtype=np.float32)
@@ -212,6 +257,8 @@ def zero_motion(current: np.ndarray, previous: np.ndarray) -> np.ndarray:
 
 @dataclass
 class TemporalOptions:
+    processing_scale: float = 1.0
+    robust_motion: bool = True
     profile: str = "standard"
     blend_scale: float = BLEND_SCALE
     intensity: float = 1.0
@@ -228,13 +275,15 @@ class TemporalSession:
     """Frame-sequence processor with display history, motion reprojection and the learned blend.
 
     ``motion`` is a callable ``(current, previous) -> (H, W, 2)`` normalised offsets (default: optical flow),
-    or engine motion passed per frame to ``process``. A scene cut (mean absolute luma change above the
-    threshold) or ``reset`` clears the history and restarts the noise frame index, like the Swift backend.
+    or engine motion passed per frame to ``process``. Optical flow checks correspondence confidence;
+    scene cuts or ``reset`` clear history and restart the noise frame index, like the Swift backend.
     """
 
     def __init__(self, pipeline, *, options: TemporalOptions | None = None, motion: Callable | str = "flow"):
         self.pipeline = pipeline
         self.options = options or TemporalOptions()
+        if not 1 <= self.options.processing_scale <= 4:
+            raise ValueError("processing_scale must be within [1, 4]")
         if self.options.profile not in PROFILES:
             raise ValueError(f"profile must be one of {tuple(PROFILES)}")
         if motion == "flow":
@@ -261,33 +310,38 @@ class TemporalSession:
                 controls[key] = value
         return controls
 
-    def process(self, frame: np.ndarray, *, motion: np.ndarray | None = None, control_mask: np.ndarray | None = None) -> np.ndarray:
+    def process(self, frame: np.ndarray, *, motion: np.ndarray | None = None, control_mask: np.ndarray | None = None,
+                history_confidence: np.ndarray | None = None) -> np.ndarray:
         frame = np.asarray(frame, dtype=np.float32)
-        if frame.ndim != 3 or frame.shape[2] != 3:
-            raise ValueError("frame must be (height, width, 3)")
-        if self.previous is not None and (self.previous.shape != frame.shape or self._is_scene_cut(frame)):
+        if frame.ndim != 3 or frame.shape[2] != 3 or not np.isfinite(frame).all():
+            raise ValueError("frame must be finite (height, width, 3)")
+        if control_mask is not None and self.options.processing_scale != 1:
+            raise ValueError("a control mask requires processing_scale=1")
+        if self.previous is not None and self.previous.shape != frame.shape:
+            self.reset()
+        estimate = resolve_motion(self.motion, frame, self.previous, motion, history_confidence,
+                                  scene_cut_threshold=self.options.scene_cut_threshold, robust_motion=self.options.robust_motion)
+        if estimate.reset:
             self.reset(); self.scene_cuts += 1
-        height, width = frame.shape[:2]
+        height, width = (round(d * self.options.processing_scale) for d in frame.shape[:2])
+        processing = resample(frame, width, height)
+        confidence = None if estimate.confidence is None else resize_guide(estimate.confidence, width, height, confidence=True)
         geometry = NetworkGeometry.vendor_aligned(width, height)
         controls = self._controls()
         if self.history is None:
-            network = make_features(frame, frame_index=self.frame_index, geometry=geometry, control_mask=control_mask, **controls)
+            network = make_features(processing, frame_index=self.frame_index, geometry=geometry, control_mask=control_mask, **controls)
             head = geometry.crop(self.pipeline.run_features(network))
-            output = compose_head(head, frame, control_mask=control_mask, intensity=self.options.intensity)
+            output = compose_head(head, processing, control_mask=control_mask, intensity=self.options.intensity)
         else:
-            if motion is None:
-                motion = self.motion(frame, self.previous)
-            features = make_temporal_features(frame, self.history, motion, frame_index=self.frame_index, control_mask=control_mask, **controls)
+            motion = resize_guide(estimate.motion_uv, width, height)
+            features = make_temporal_features(processing, self.history, motion, frame_index=self.frame_index,
+                                              history_confidence=confidence, control_mask=control_mask, **controls)
             network = extend_features(features, geometry, self.frame_index)
             head = geometry.crop(self.pipeline.run_features(network))
-            output = compose_temporal(head, frame, features, blend_scale=self.options.blend_scale, control_mask=control_mask, intensity=self.options.intensity)
-        self.history = output; self.previous = frame; self.frame_index += 1
+            output = compose_temporal(head, processing, features, blend_scale=self.options.blend_scale,
+                                      history_confidence=confidence, control_mask=control_mask, intensity=self.options.intensity)
+        self.history = output.copy(); self.previous = frame.copy(); self.frame_index += 1
         return compose_detail(
-            frame, output, detail_strength=self.options.detail_strength, colour_strength=self.options.colour_strength, radius=self.options.detail_radius
+            frame, resample(output, frame.shape[1], frame.shape[0]), detail_strength=self.options.detail_strength,
+            colour_strength=self.options.colour_strength, radius=self.options.detail_radius
         )
-
-    def _is_scene_cut(self, frame: np.ndarray) -> bool:
-        if self.options.scene_cut_threshold <= 0:
-            return False
-        luma = lambda f: f[..., 0] * 0.2126 + f[..., 1] * 0.7152 + f[..., 2] * 0.0722
-        return float(np.abs(luma(frame) - luma(self.previous)).mean()) > self.options.scene_cut_threshold

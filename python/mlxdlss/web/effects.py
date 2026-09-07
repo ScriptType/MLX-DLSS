@@ -25,8 +25,6 @@ class NeuralRender(BaseModel):
     def model_post_init(self, _context) -> None:
         if self.profile not in PROFILE_NAMES:
             raise ValueError(f"profile must be one of {PROFILE_NAMES}")
-        if self.temporal and self.processing_scale != 1.0:
-            raise ValueError("temporal mode runs at the native scale (processing_scale must be 1)")
 
 
 class FrameGen(BaseModel):
@@ -59,10 +57,15 @@ def media_kind(filename: str) -> MediaKind:
     raise ValueError(f"unsupported file type '{suffix}': images {sorted(IMAGE_SUFFIXES)}, videos {sorted(VIDEO_SUFFIXES)}")
 
 
-def parse_effects(raw) -> list[NeuralRender | FrameGen]:
+def parse_effects(raw, *, kind: MediaKind | None = None) -> list[NeuralRender | FrameGen]:
     """Validate a list of effect dicts (or models) into models; raises ValueError."""
     try:
-        return EffectList.validate_python([e.model_dump() if isinstance(e, BaseModel) else e for e in raw])
+        values = [e.model_dump() if isinstance(e, BaseModel) else e.copy() if isinstance(e, dict) else e for e in raw]
+        if kind is not None:
+            for effect in values:
+                if isinstance(effect, dict) and effect.get("kind") == "nr":
+                    effect.setdefault("temporal", kind == "video")
+        return EffectList.validate_python(values)
     except ValidationError as error:
         raise ValueError("; ".join(f"{'.'.join(str(p) for p in e['loc'])}: {e['msg']}" for e in error.errors())) from error
 
@@ -92,7 +95,7 @@ def describe_effects(*, mlxdlss_available: bool, fg_weights: bool, nr_weights: b
                     "colour_strength": {"type": "number", "min": 0.0, "max": 4.0, "default": 1.0},
                     "detail_radius": {"type": "number", "min": 1.0, "max": 16.0, "default": 4.0},
                     "intensity": {"type": "number", "min": 0.0, "max": 2.0, "default": 1.0},
-                    "temporal": {"type": "bool", "default": False, "media": ["video"]},
+                    "temporal": {"type": "bool", "default": True, "media": ["video"]},
                 },
             },
             {

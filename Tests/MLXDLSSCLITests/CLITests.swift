@@ -3,6 +3,7 @@ import Foundation
 import ImageIO
 import DLSSMLX
 import XCTest
+@testable import mlxdlss
 
 final class CLITests: XCTestCase {
   func testRunSequenceRejectsUnknownNetworkGeometry() throws {
@@ -53,6 +54,130 @@ final class CLITests: XCTestCase {
     let scaled = try runCLI(["stream", "/definitely/missing/model.dlssmodel", "--width", "16", "--height", "16", "--processing-scale", "2"])
     XCTAssertEqual(scaled.status, 2)
     XCTAssertTrue(scaled.stderr.contains("native scale"), scaled.stderr)
+  }
+
+  func testStreamRejectsUnknownProtocolAndNonfiniteBlendScaleBeforeOpeningModel() throws {
+    for options in [
+      ["--protocol-version", "3"], ["--protocol-version", "x"], ["--blend-scale", "nan"],
+    ] {
+      let result = try runCLI(
+        ["stream", "/definitely/missing/model.dlssmodel", "--width", "1", "--height", "1"] + options
+      )
+      XCTAssertEqual(result.status, 2)
+      XCTAssertFalse(result.stderr.contains("packageIsNotDirectory"), result.stderr)
+      XCTAssertTrue(result.stderr.contains(options[0]), result.stderr)
+    }
+  }
+
+  func testStreamFrameDecoderVersionedConfidenceAndOrdering() throws {
+    var payload = streamPayload(flags: 3, values: [0.25, 0.5, 0.75, -0.1, 0.2, 1, 0.375])
+    payload.append(streamPayload(flags: 0, values: [0.75, 0.5, 0.25, 0, 0, 1]))
+    try withInputPipe(payload) { handle in
+      let first = try XCTUnwrap(
+        StreamCommand.readFrame(
+          from: handle, width: 1, height: 1, temporal: true, protocolVersion: 2))
+      XCTAssertEqual(first.flags, 3)
+      XCTAssertEqual(
+        first.inputs.map { $0.descriptor.name }, ["color", "motion", "depth", "historyConfidence"])
+      XCTAssertEqual(first.inputs.last?.bytes, [Float(0.375)].withUnsafeBytes { Data($0) })
+      let second = try XCTUnwrap(
+        StreamCommand.readFrame(
+          from: handle, width: 1, height: 1, temporal: true, protocolVersion: 2))
+      XCTAssertEqual(second.inputs.count, 3)
+      XCTAssertNil(
+        try StreamCommand.readFrame(
+          from: handle, width: 1, height: 1, temporal: true, protocolVersion: 2))
+    }
+  }
+
+  func testStreamFrameDecoderPreservesLegacyLayoutsInBothVersions() throws {
+    for version in [1, 2] {
+      for temporal in [false, true] {
+        let values: [Float] = temporal ? [0.25, 0.5, 0.75, 0, 0, 1] : [0.25, 0.5, 0.75]
+        try withInputPipe(streamPayload(flags: 1, values: values)) { handle in
+          let frame = try XCTUnwrap(
+            StreamCommand.readFrame(
+              from: handle, width: 1, height: 1, temporal: temporal, protocolVersion: version))
+          XCTAssertEqual(frame.flags, 1)
+          XCTAssertEqual(
+            frame.inputs.map { $0.descriptor.name },
+            temporal ? ["color", "motion", "depth"] : ["color"])
+          XCTAssertNil(
+            try StreamCommand.readFrame(
+              from: handle, width: 1, height: 1, temporal: temporal, protocolVersion: version))
+        }
+      }
+    }
+  }
+
+  func testStreamFrameDecoderRejectsMalformedMapsAndTruncation() throws {
+    let valid: [Float] = [0.25, 0.5, 0.75, 0, 0, 1, 0.5]
+    var cases: [(Data, Bool, Int)] = [
+      (streamPayload(flags: 2, values: valid), true, 1),
+      (streamPayload(flags: 4, values: valid), true, 2),
+      (streamPayload(flags: 2, values: valid), false, 2),
+      (streamPayload(flags: 0, values: valid), true, 3),
+      (Data([0, 0]), true, 2),
+    ]
+    for value: Float in [.nan, .infinity, -.infinity, -0.1, 1.1] {
+      var malformed = valid
+      malformed[6] = value
+      cases.append((streamPayload(flags: 2, values: malformed), true, 2))
+    }
+    for index in [0, 3, 5] {
+      var malformed = valid
+      malformed[index] = .nan
+      cases.append((streamPayload(flags: 2, values: malformed), true, 2))
+    }
+    let frame = streamPayload(flags: 2, values: valid)
+    for length in 4..<frame.count {
+      cases.append((Data(frame.prefix(length)), true, 2))
+    }
+    for (payload, temporal, version) in cases {
+      try withInputPipe(payload) { handle in
+        XCTAssertThrowsError(
+          try StreamCommand.readFrame(
+            from: handle, width: 1, height: 1, temporal: temporal, protocolVersion: version))
+      }
+    }
+  }
+
+  func testExternalStreamRejectsBadConfidenceWithoutOutputOrHungProcess() throws {
+    guard let packagePath = ProcessInfo.processInfo.environment["MLXDLSS_NEURAL_RENDERING_PACKAGE"]
+    else {
+      throw XCTSkip(
+        "set MLXDLSS_NEURAL_RENDERING_PACKAGE to run malformed stream subprocess probes")
+    }
+    let valid: [Float] = [0.25, 0.5, 0.75, 0, 0, 1, 0.5]
+    var malformed = valid
+    malformed[6] = .nan
+    for payload in [
+      streamPayload(flags: 2, values: malformed),
+      Data(streamPayload(flags: 2, values: valid).dropLast()),
+    ] {
+      let result = try runCLI(
+        [
+          "stream", packagePath, "--width", "1", "--height", "1", "--protocol-version", "2",
+        ], input: payload)
+      XCTAssertEqual(result.status, 2, result.stderr)
+      XCTAssertTrue(result.stdout.isEmpty)
+      XCTAssertTrue(result.stderr.contains("stream:"), result.stderr)
+    }
+  }
+
+  private func streamPayload(flags: UInt32, values: [Float]) -> Data {
+    var word = flags.littleEndian
+    var data = withUnsafeBytes(of: &word) { Data($0) }
+    data.append(values.withUnsafeBytes { Data($0) })
+    return data
+  }
+
+  private func withInputPipe(_ data: Data, body: (FileHandle) throws -> Void) throws {
+    let pipe = Pipe()
+    pipe.fileHandleForWriting.write(data)
+    try pipe.fileHandleForWriting.close()
+    defer { try? pipe.fileHandleForReading.close() }
+    try body(pipe.fileHandleForReading)
   }
 
   func testRenderImageRequiresOutputOption() throws {
@@ -1118,7 +1243,7 @@ final class CLITests: XCTestCase {
     }
   }
 
-  private func runCLI(_ arguments: [String]) throws -> ProcessResult {
+  private func runCLI(_ arguments: [String], input: Data? = nil) throws -> ProcessResult {
     let process = Process()
     process.executableURL = cliExecutableURL()
     process.arguments = arguments
@@ -1127,8 +1252,22 @@ final class CLITests: XCTestCase {
     process.standardOutput = stdout
     process.standardError = stderr
 
+    let completed = DispatchSemaphore(value: 0)
+    let stdin = Pipe()
+    if let input {
+      process.standardInput = stdin
+      stdin.fileHandleForWriting.write(input)
+      try stdin.fileHandleForWriting.close()
+      process.terminationHandler = { _ in completed.signal() }
+    }
     try process.run()
-    process.waitUntilExit()
+    if input != nil, completed.wait(timeout: .now() + 30) == .timedOut {
+      process.terminate()
+      process.waitUntilExit()
+      XCTFail("stream did not terminate after malformed input")
+    } else {
+      process.waitUntilExit()
+    }
 
     return ProcessResult(
       status: process.terminationStatus,

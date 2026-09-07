@@ -94,7 +94,8 @@ class ConvertOptions:
     overwrite: bool = False
     status_interval: float = 60.0
     enhance: dict[str, Any] = field(default_factory=dict)
-    temporal: bool = False
+    temporal: bool = True
+    robust_motion: bool = True
     motion: str = "flow"           # temporal mode: 'flow' (optical flow) or 'zero'
     scene_cut_threshold: float = 0.3
     blend_scale: float = BLEND_SCALE
@@ -114,6 +115,9 @@ class ConvertResult:
     fps: float
     output: Path
     scene_cuts: int = 0
+    temporal: bool = False
+    motion: str = "none"
+    processing_scale: float = 1.0
 
 
 def convert(
@@ -180,6 +184,7 @@ def convert(
             raise VideoToolError("backend 'mlxdlss' needs --model MODEL.dlssmodel")
         stream = MLXDLSSStreamSession(
             options.model_package, info.width, info.height, temporal=options.temporal, motion=options.motion,
+            blend_scale=options.blend_scale, robust_motion=options.robust_motion,
             scene_cut_threshold=options.scene_cut_threshold, mlxdlss=options.mlxdlss, profile=enhance.get("profile", "standard"),
             intensity=enhance.get("intensity", 1.0), execution=options.execution, precision=options.precision,
             processing_scale=enhance.get("processing_scale", 1.0), detail_strength=enhance.get("detail_strength", 1.0),
@@ -189,16 +194,25 @@ def convert(
         session = TemporalSession(
             pipeline,
             options=TemporalOptions(
+                processing_scale=enhance.get("processing_scale", 1.0), robust_motion=options.robust_motion,
                 profile=enhance.get("profile", "standard"), blend_scale=options.blend_scale, intensity=enhance.get("intensity", 1.0),
                 scene_cut_threshold=options.scene_cut_threshold, detail_strength=enhance.get("detail_strength", 1.0),
                 colour_strength=enhance.get("colour_strength", 1.0), detail_radius=enhance.get("detail_radius", 4.0),
             ),
             motion=options.motion,
         )
-        if enhance.get("processing_scale", 1.0) != 1.0:
-            raise VideoToolError("temporal mode runs at the native scale (processing_scale must be 1)")
-    decoder = subprocess.Popen(decode, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    encoder = subprocess.Popen(encode, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+    log(f"MODE {'temporal' if options.temporal else 'independent'} motion={options.motion if options.temporal else 'none'} scale={enhance.get('processing_scale', 1.0):g}")
+    decoder = encoder = None
+    try:
+        decoder = subprocess.Popen(decode, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        encoder = subprocess.Popen(encode, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+    except BaseException:
+        if decoder is not None:
+            decoder.kill(); decoder.wait()
+            decoder.stdout.close(); decoder.stderr.close()
+        if stream is not None:
+            stream.abort()
+        raise
     started = time.perf_counter(); last_status = started; frames = 0
     def emit_temporal(frame):
         nonlocal frames
@@ -220,10 +234,12 @@ def convert(
             frames += 1
             if progress is not None:
                 progress(frames, expected)
+    cancelled = False
     try:
         pending = []
         while True:
             if should_stop is not None and should_stop():
+                cancelled = True
                 break
             chunk = decoder.stdout.read(frame_bytes)
             if len(chunk) < frame_bytes:
@@ -246,24 +262,33 @@ def convert(
         if stream is not None:
             stream.close()
         encoder.stdin.close()
+        if cancelled and decoder.poll() is None:
+            decoder.kill()
         decoder_error = decoder.stderr.read().decode(errors="replace").strip()
         encoder_error = encoder.stderr.read().decode(errors="replace").strip()
         decoder.wait(); encoder.wait()
     finally:
+        if stream is not None:
+            stream.abort()
         for process in (decoder, encoder):
             if process.poll() is None:
                 process.kill()
+            process.wait()
             for pipe in (process.stdin, process.stdout, process.stderr):
                 if pipe is not None:
-                    pipe.close()
-    if decoder.returncode:
+                    try:
+                        pipe.close()
+                    except OSError:
+                        pass
+    if decoder.returncode and not cancelled:
         raise VideoToolError(f"ffmpeg decode failed: {decoder_error}")
     if encoder.returncode:
         raise VideoToolError(f"ffmpeg encode failed: {encoder_error}")
     seconds = time.perf_counter() - started
     cuts = session.scene_cuts if session is not None else (stream.scene_cuts if stream is not None else 0)
     log(f"DONE frames {frames} in {seconds:.1f} s ({frames / seconds if seconds else 0:.2f} fps){f', scene cuts {cuts}' if options.temporal else ''} -> {destination}")
-    return ConvertResult(frames, seconds, info.width, info.height, info.fps, destination, cuts)
+    return ConvertResult(frames, seconds, info.width, info.height, info.fps, destination, cuts, options.temporal,
+                         options.motion if options.temporal else "none", enhance.get("processing_scale", 1.0))
 
 
 def compare_command(original: str | Path, processed: str | Path, *, player: str | None = None) -> list[str]:

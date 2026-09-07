@@ -265,6 +265,22 @@ feature. A stronger local stress changed this checkpoint's composed RGB by at
 most `0.0010376`; this is sensitivity evidence, not permission to weaken a
 bundle-specific NVIDIA comparison threshold.
 
+## Video correspondence adaptation
+
+New video jobs use temporal rendering by default. The video adapter estimates
+both directions of DIS flow and builds confidence from forward/backward
+consistency, photometric agreement and in-bounds history coordinates. Invalid
+regions are expanded by three source pixels. Confidence mixes current and
+reprojected history features and multiplies the recovered postprocessing alpha;
+it does not alter weights or add network channels. With confidence omitted the
+reference path is unchanged. Scene resets use reprojection error and coverage
+so a well-tracked high-contrast pan does not reset merely because pixels moved.
+
+These are port-specific video heuristics, not newly established NVIDIA parity.
+Tests cover known horizontal/vertical/subpixel translations, disocclusion,
+cuts, flashes, fades, confidence endpoints and scaled history. Temporal output
+can still drift; these checks do not establish universal ghost-free behavior.
+
 ## Roadmap
 
 Done: the 71-block graph on MLX/Metal, PyTorch and Core ML with measured gates

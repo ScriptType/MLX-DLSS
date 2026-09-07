@@ -71,6 +71,7 @@ public actor MLXNeuralRenderingDeviceTemporalBackend: NeuralRenderBackend {
     let motion = try requiredInput("motion", in: request)
     let depth = try requiredInput("depth", in: request)
     let controlMask = request.input(named: "controlMask")
+    let historyConfidence = request.input(named: "historyConfidence")
     try validate(color, name: "color", channels: 3, expectedSpatialShape: nil)
     let spatialShape = Array(color.descriptor.shape.prefix(3))
     try validateResourceShape(
@@ -100,6 +101,10 @@ public actor MLXNeuralRenderingDeviceTemporalBackend: NeuralRenderBackend {
         expectedSpatialShape: spatialShape
       )
     }
+    if let historyConfidence {
+      try validate(historyConfidence, name: "historyConfidence", channels: 1, expectedSpatialShape: spatialShape)
+      try validateHistoryConfidenceValues(historyConfidence)
+    }
     let descriptors = [color.descriptor, motion.descriptor, depth.descriptor]
     if let resetRequest = try tracker.prepare(
       cadence: temporalCadence,
@@ -113,6 +118,7 @@ public actor MLXNeuralRenderingDeviceTemporalBackend: NeuralRenderBackend {
     do {
       let colorArray = array(color)
       let controlMaskArray = controlMask.map(array)
+      let confidenceArray = historyConfidence.map(array)
       let started = ContinuousClock.now
       let logicalHeight = color.descriptor.shape[1]
       let logicalWidth = color.descriptor.shape[2]
@@ -136,6 +142,7 @@ public actor MLXNeuralRenderingDeviceTemporalBackend: NeuralRenderBackend {
           depth: array(depth),
           depthInverted: depthInverted,
           depthGuideMode: .observedZeroDescriptor,
+          historyConfidence: confidenceArray,
           featureControls: featureControls
         )
         networkFeatures = features
@@ -179,6 +186,7 @@ public actor MLXNeuralRenderingDeviceTemporalBackend: NeuralRenderBackend {
             depth: array(depth),
             depthInverted: depthInverted,
             depthGuideMode: .observedZeroDescriptor,
+            historyConfidence: confidenceArray,
             featureControls: featureControls
           )
           networkFeatures =
@@ -207,6 +215,7 @@ public actor MLXNeuralRenderingDeviceTemporalBackend: NeuralRenderBackend {
         currentColor: colorArray,
         features: features,
         hasHistory: history != nil,
+        historyConfidence: confidenceArray,
         controlMask: controlMaskArray,
         intensity: controlMaskIntensity
       )
@@ -378,11 +387,25 @@ public actor MLXNeuralRenderingDeviceTemporalBackend: NeuralRenderBackend {
   }
 }
 
+public enum MLXTemporalConfidenceError: Error, Equatable, Sendable {
+  case invalidValues
+}
+
+func validateHistoryConfidenceValues(_ tensor: HostTensor) throws {
+  let valid = tensor.bytes.withUnsafeBytes { bytes in
+    stride(from: 0, to: bytes.count, by: MemoryLayout<Float>.size).allSatisfy { offset in
+      let value = bytes.loadUnaligned(fromByteOffset: offset, as: Float.self)
+      return value.isFinite && value >= 0 && value <= 1
+    }
+  }
+  guard valid else { throw MLXTemporalConfidenceError.invalidValues }
+}
+
 final class MLXTemporalPostprocessor: @unchecked Sendable {
   private let alphaLookup: MLXArray
   private let kernel = MLXFast.metalKernel(
     name: "mlxdlss_temporal_postprocess",
-    inputNames: ["head", "currentColor", "features", "alphaLookup", "controlMask"],
+    inputNames: ["head", "currentColor", "features", "alphaLookup", "controlMask", "historyConfidence"],
     outputNames: ["output"],
     source: #"""
       uint pixel = thread_position_in_grid.x;
@@ -397,6 +420,9 @@ final class MLXTemporalPostprocessor: @unchecked Sendable {
       if (hasHistory) {
         ushort logitIndex = as_type<ushort>(half(head[headOffset + 3]));
         alpha = alphaLookup[logitIndex];
+        if (hasHistoryConfidence) {
+          alpha *= historyConfidence[pixel];
+        }
       }
       for (uint channel = 0; channel < 3; ++channel) {
         float residual = float(half(head[headOffset + channel])) * 0.25f;
@@ -448,13 +474,15 @@ final class MLXTemporalPostprocessor: @unchecked Sendable {
     currentColor: MLXArray,
     features: MLXArray,
     hasHistory: Bool,
+    historyConfidence: MLXArray? = nil,
     controlMask: MLXArray? = nil,
     intensity: Float = 1
   ) -> MLXArray {
     kernel(
-      [head, currentColor, features, alphaLookup, controlMask ?? currentColor],
+      [head, currentColor, features, alphaLookup, controlMask ?? currentColor, historyConfidence ?? currentColor],
       template: [
         ("hasHistory", hasHistory),
+        ("hasHistoryConfidence", historyConfidence != nil),
         ("hasEffectBlend", controlMask != nil || intensity != 1),
         ("hasControlMask", controlMask != nil),
         ("intensityBits", Int(intensity.bitPattern)),
@@ -757,7 +785,7 @@ final class MLXTemporalFeatureProcessor: @unchecked Sendable {
     name: "mlxdlss_temporal_history_features",
     inputNames: [
       "baseFeatures", "color", "controlMask", "frameIndex",
-      "featureControls", "history", "motion", "depth",
+      "featureControls", "history", "motion", "depth", "historyConfidence",
     ],
     outputNames: ["output"],
     source: source,
@@ -773,6 +801,7 @@ final class MLXTemporalFeatureProcessor: @unchecked Sendable {
     depth: MLXArray,
     depthInverted: Bool,
     depthGuideMode: NeuralRenderingDepthGuideMode = .observedZeroDescriptor,
+    historyConfidence: MLXArray? = nil,
     featureControls: NeuralRenderingFeatureControls = .init()
   ) -> MLXArray {
     process(
@@ -788,6 +817,7 @@ final class MLXTemporalFeatureProcessor: @unchecked Sendable {
       depth: depth,
       depthInverted: depthInverted,
       depthGuideMode: depthGuideMode,
+      historyConfidence: historyConfidence,
       featureControls: featureControls
     )
   }
@@ -803,6 +833,7 @@ final class MLXTemporalFeatureProcessor: @unchecked Sendable {
     depth: MLXArray,
     depthInverted: Bool,
     depthGuideMode: NeuralRenderingDepthGuideMode = .observedZeroDescriptor,
+    historyConfidence: MLXArray? = nil,
     featureControls: NeuralRenderingFeatureControls = .init()
   ) -> MLXArray {
     process(
@@ -818,6 +849,7 @@ final class MLXTemporalFeatureProcessor: @unchecked Sendable {
       depth: depth,
       depthInverted: depthInverted,
       depthGuideMode: depthGuideMode,
+      historyConfidence: historyConfidence,
       featureControls: featureControls
     )
   }
@@ -835,6 +867,7 @@ final class MLXTemporalFeatureProcessor: @unchecked Sendable {
     depth: MLXArray,
     depthInverted: Bool,
     depthGuideMode: NeuralRenderingDepthGuideMode,
+    historyConfidence: MLXArray?,
     featureControls: NeuralRenderingFeatureControls
   ) -> MLXArray {
     let logicalWidth = baseFeatures.shape[2]
@@ -865,6 +898,7 @@ final class MLXTemporalFeatureProcessor: @unchecked Sendable {
     )
     template += [
       ("generateBaseFeatures", generateBaseFeatures),
+      ("hasHistoryConfidence", historyConfidence != nil),
       ("depthInverted", depthInverted),
       ("useClosestDepth", depthGuideMode == .closestDepth),
       ("logicalWidth", logicalWidth),
@@ -892,6 +926,7 @@ final class MLXTemporalFeatureProcessor: @unchecked Sendable {
         history,
         motion,
         depth,
+        historyConfidence ?? depth,
       ],
       template: template,
       grid: (baseFeatures.shape[2], baseFeatures.shape[1], 1),
@@ -1114,8 +1149,22 @@ final class MLXTemporalFeatureProcessor: @unchecked Sendable {
         history, historyResourceWidth, historyResourceHeight, outer3X, middleY
       ) * rightWeight
     ) / (leftWeight + topWeight + middleWeight + bottomWeight + rightWeight);
-    output[featureOffset + 7] = mlxdlssScaledColor(sampled.x);
-    output[featureOffset + 8] = mlxdlssScaledColor(sampled.y);
-    output[featureOffset + 9] = mlxdlssScaledColor(sampled.z);
+    float3 reprojected = float3(
+      mlxdlssScaledColor(sampled.x),
+      mlxdlssScaledColor(sampled.y),
+      mlxdlssScaledColor(sampled.z)
+    );
+    for (int channel = 0; channel < 3; ++channel) {
+      float result = reprojected[channel];
+      if (hasHistoryConfidence) {
+        float confidence = historyConfidence[pixel];
+        float current = output[featureOffset + 4 + channel];
+        // Preserve both exact endpoint features without another half conversion.
+        result = confidence == 0.0f ? current
+          : confidence == 1.0f ? result
+          : current + confidence * (result - current);
+      }
+      output[featureOffset + 7 + channel] = result;
+    }
     """#
 }

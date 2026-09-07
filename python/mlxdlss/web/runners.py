@@ -123,7 +123,7 @@ class JobRunner:
                 report(f"{name} {done}/{total if total is not None else '?'}", base + fraction / stages, done, total)
 
             if isinstance(effect, NeuralRender):
-                self._neural_rendering_video(current, target, effect, settings, progress, should_stop)
+                job.diagnostics = self._neural_rendering_video(current, target, effect, settings, progress, should_stop)
             else:
                 self._frame_generation_video(current, target, effect, settings, progress, should_stop)
             if should_stop():
@@ -137,7 +137,7 @@ class JobRunner:
             job.preview = preview.name
         return [current]
 
-    def _neural_rendering_video(self, source: Path, target: Path, nr: NeuralRender, settings: Settings, progress, should_stop) -> None:
+    def _neural_rendering_video(self, source: Path, target: Path, nr: NeuralRender, settings: Settings, progress, should_stop) -> dict:
         from ..video import ConvertOptions, convert
 
         backend = settings.resolved_backend("nr")
@@ -154,7 +154,9 @@ class JobRunner:
                 raise ValueError("set the neural rendering weights (logical safetensors) in Settings")
             pipeline = self.cache.neural_rendering(settings.nr_weights, settings.device, settings.precision)
             options = ConvertOptions(temporal=nr.temporal, overwrite=True, status_interval=1e9, enhance=enhance)
-        convert(source, target, pipeline, options, log=lambda _m: None, progress=progress, should_stop=should_stop)
+        result = convert(source, target, pipeline, options, log=lambda _m: None, progress=progress, should_stop=should_stop)
+        return {"temporal": result.temporal, "motion": result.motion, "processing_scale": result.processing_scale,
+                "scene_cuts": result.scene_cuts}
 
     def _frame_generation_video(self, source: Path, target: Path, fg: FrameGen, settings: Settings, progress, should_stop) -> None:
         from ..framegen_video import FrameGenOptions, interpolate_video

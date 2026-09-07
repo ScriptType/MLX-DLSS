@@ -47,3 +47,21 @@ class MLXDLSSStreamTests(unittest.TestCase):
         output = session.process_frame(frame)
         summary = session.close()
         self.assertEqual(output.shape, (48, 64, 3)); self.assertEqual(summary.get("mode"), "first-frame")
+
+    def test_scaled_temporal_confidence_and_invalid_frame_preserve_pipe_order(self):
+        frame = np.random.default_rng(4).random((17, 19, 3), dtype=np.float32)
+        for scale in (1.5, 2, 4):
+            with self.subTest(scale=scale):
+                session = MLXDLSSStreamSession(self.package, 19, 17, motion="zero", processing_scale=scale, mlxdlss=MLXDLSS_BINARY)
+                try:
+                    with self.assertRaises(ValueError):
+                        session.process_frame(frame, motion=np.full((17, 19, 2), np.nan))
+                    first = session.process_frame(frame)
+                    second = session.process_frame(frame, history_confidence=np.zeros((17, 19, 1), np.float32))
+                    self.assertEqual(first.shape, frame.shape)
+                    self.assertTrue(np.isfinite(second).all())
+                    summary = session.close()
+                    self.assertEqual(summary["frames"], 2)
+                    self.assertEqual(summary["shape"], [round(17 * scale), round(19 * scale), 3])
+                finally:
+                    session.abort()

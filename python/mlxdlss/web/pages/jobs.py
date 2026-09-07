@@ -40,6 +40,8 @@ def jobs_page() -> None:
                             when = time.strftime("%Y-%m-%d %H:%M", time.localtime(job.created))
                             extra = f" · {job.seconds:.0f} s" if job.seconds else ""
                             ui.label(f"{when} · {_effects_summary(job.effects)}{extra}").classes("mlxdlss-list-meta truncate")
+                            if job.kind == "video" and job.diagnostics.get("temporal"):
+                                ui.label(f"Temporal · {job.diagnostics.get('scene_cuts', 0)} scene resets · scale {job.diagnostics.get('processing_scale', 1):g}").classes("mlxdlss-list-meta")
                             if job.state == "running":
                                 ui.label(job.stage or "").classes("mlxdlss-list-meta mlxdlss-mono")
                                 with ui.element("div").classes("mt-2"):

@@ -3,6 +3,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from mlxdlss import NeuralRenderingPipeline
 from mlxdlss.video import ConvertOptions, VideoToolError, compare_command, convert, probe
@@ -24,6 +25,39 @@ def make_clip(path: pathlib.Path, frames: int = 4, size: str = "64x48") -> None:
 
 @unittest.skipUnless(FFMPEG, "ffmpeg and ffprobe are required")
 class VideoTests(unittest.TestCase):
+    def test_temporal_cancellation_reaps_ffmpeg_processes(self):
+        from .test_video_temporal_quality import ProbePipeline
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            make_clip(root / "clip.mp4", frames=20)
+            processes = []
+            original_popen = subprocess.Popen
+            def tracked(*args, **kwargs):
+                process = original_popen(*args, **kwargs)
+                processes.append(process)
+                return process
+            completed = []
+            with patch("mlxdlss.video.subprocess.Popen", side_effect=tracked):
+                result = convert(root / "clip.mp4", root / "out.mp4", ProbePipeline(), ConvertOptions(audio="none"),
+                                 log=lambda _: None, progress=lambda count, total: completed.append(count),
+                                 should_stop=lambda: bool(completed))
+            self.assertEqual(result.frames, 1)
+            self.assertTrue(all(process.poll() is not None for process in processes))
+
+    def test_default_temporal_preserves_audio_and_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            clip, out = root / "clip.mp4", root / "out.mp4"
+            make_clip(clip, frames=3)
+            pipeline = NeuralRenderingPipeline(synthetic_weights(), device="cpu")
+            result = convert(clip, out, pipeline, ConvertOptions(), log=lambda _: None)
+            self.assertTrue(result.temporal)
+            info = probe(out)
+            self.assertEqual((info.width, info.height, info.frame_count), (64, 48, 3))
+            self.assertEqual(info.fps, 10)
+            self.assertTrue(info.has_audio)
+
     def test_probe_reports_size_rate_frames_and_audio(self):
         with tempfile.TemporaryDirectory() as directory:
             clip = pathlib.Path(directory) / "clip.mp4"
@@ -41,7 +75,7 @@ class VideoTests(unittest.TestCase):
             make_clip(clip, frames=3)
             pipeline = NeuralRenderingPipeline(synthetic_weights(), device="cpu")
             logs = []
-            result = convert(clip, out, pipeline, ConvertOptions(batch=2, status_interval=0), log=logs.append)
+            result = convert(clip, out, pipeline, ConvertOptions(batch=2, status_interval=0, temporal=False), log=logs.append)
             self.assertEqual(result.frames, 3)
             info = probe(out)
             self.assertEqual((info.width, info.height), (64, 48))

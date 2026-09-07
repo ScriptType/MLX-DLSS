@@ -103,18 +103,32 @@ Video through the neural renderer:
 
 ```sh
 mlxdlss-video convert in.mp4 out.mp4 --backend mlxdlss --model weights/NeuralRendering.dlssmodel --temporal --encode-args "-c:v libx265 -crf 20 -preset slow"
-mlxdlss-video convert in.mp4 out.mp4 --weights weights/dlssnr-weights-logical.safetensors --device cuda --batch 4 --processing-scale 2 --detail-strength 2
+mlxdlss-video convert in.mp4 out.mp4 --weights weights/dlssnr-weights-logical.safetensors --device cuda --processing-scale 2 --detail-strength 2
 mlxdlss-video convert in.mp4 clip.mp4 --weights ... --start-frame 300 --frames 120 --decode-args "-vf scale=1280:-2"
 mlxdlss-video probe in.mp4
 mlxdlss-video compare in.mp4 out.mp4          # original | processed side by side in mpv
 ```
 
-`--temporal` reprojects the previous output with motion (OpenCV DIS optical
-flow, or engine motion through the Python API) and blends it with the learned
-history weight; `--scene-cut` resets the history on a luma jump. Default
+Temporal is enabled by default for new videos. It reprojects the previous
+rendered output with OpenCV DIS optical flow and feeds that history into the
+network, then blends with the learned history weight. Forward/backward flow
+consistency, frame differences after reprojection, and image boundaries reject
+unreliable history around occlusions. Scene changes reset history and noise;
+`--scene-cut 0` disables automatic resets. These confidence checks are video
+heuristics added by this port, not recovered NVIDIA behavior.
+
+`--no-temporal` restores independent frames; `--motion zero` is a diagnostic
+for static scenes. Temporal processes frames sequentially, ignoring `--batch`.
+Both Metal and PyTorch support `--processing-scale 1–4`: history stays at the
+processing resolution, while detail controls apply after downsampling to the
+original output size. Python callers may supply engine motion as normalized
+current-to-previous UV offsets and an optional H×W×1 confidence map in [0, 1].
+Metal temporal video requires rebuilding the Swift binary for stream protocol 2.
+
+Default
 encoding: `-c:v libx264 -crf 18 -preset medium -pix_fmt yuv420p -movflags +faststart`;
 `--pix-fmt rgb48le` keeps 16-bit sources; `--status-interval` seconds between
-progress lines. Temporal mode runs at the native scale.
+progress lines.
 
 Web front end:
 
@@ -127,6 +141,10 @@ frame generation in either order; the result plays in place, a side-by-side
 comparison with the original is one click away), Jobs (queue, progress,
 cancel, downloads), Settings (weight paths, backend, device, theme). Jobs run
 one at a time; results are stored under `~/MLX-DLSS/outputs/<job>/`.
+New video forms and API jobs with omitted `temporal` enable it automatically.
+Saved jobs retain their settings, explicit `temporal: false` remains respected,
+and still images keep their existing behavior. Completed video jobs show the
+temporal reset count and processing scale.
 HTTP API: `GET /api/effects`, `POST /api/jobs` (multipart `file` + JSON
 `effects`), `GET /api/jobs[/{id}]`, `POST /api/jobs/{id}/cancel`,
 `GET /api/jobs/{id}/output/{n}` (inline), `GET /api/jobs/{id}/download/{n}`,

@@ -46,8 +46,7 @@ class EffectTests(unittest.TestCase):
             parse_effects([{"kind": "fg", "mode": "fps", "audio": "stretch"}])
         with self.assertRaises(ValueError):
             parse_effects([{"kind": "nr", "profile": "no-such-profile"}])
-        with self.assertRaises(ValueError):
-            parse_effects([{"kind": "nr", "temporal": True, "processing_scale": 2}])
+        self.assertEqual(parse_effects([{"kind": "nr", "temporal": True, "processing_scale": 2}])[0].processing_scale, 2)
         with self.assertRaises(ValueError):
             parse_effects([{"kind": "fg", "factor": 5}])
 
@@ -59,6 +58,18 @@ class EffectTests(unittest.TestCase):
 
 
 class JobQueueTests(unittest.TestCase):
+    def test_new_video_default_and_saved_opt_out_survive_reload(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            store = JobStore(root)
+            new = store.create("new.mp4", [{"kind": "nr"}], data=b"data")
+            old = store.create("old.mp4", [{"kind": "nr", "temporal": False}], data=b"data")
+            image = store.create("photo.png", [{"kind": "nr"}], data=b"data")
+            again = JobStore(root)
+            self.assertTrue(again.get(new.id).effects[0]["temporal"])
+            self.assertFalse(again.get(old.id).effects[0]["temporal"])
+            self.assertFalse(again.get(image.id).effects[0]["temporal"])
+
     def test_store_queue_cancel_and_persistence(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
@@ -181,6 +192,11 @@ class ApiAndRunnerTests(unittest.TestCase):
         self.assertEqual(self.client.get(f"/api/jobs/{job['id']}/input").status_code, 200)
 
     def test_bad_requests(self):
+        for entry in (None, 42, False):
+            with self.subTest(entry=entry):
+                response = self.client.post("/api/jobs", files={"file": ("clip.mp4", b"invalid", "video/mp4")},
+                                            data={"effects": json.dumps([entry])})
+                self.assertEqual(response.status_code, 400, response.text)
         response = self.client.post("/api/jobs", files={"file": ("photo.png", _png_bytes(), "image/png")},
                                     data={"effects": json.dumps([{"kind": "fg"}])})
         self.assertEqual(response.status_code, 400)
@@ -192,16 +208,17 @@ class ApiAndRunnerTests(unittest.TestCase):
         src = pathlib.Path(self.directory) / "src.mp4"
         subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=64x48:rate=10:duration=0.4",
                         "-c:v", "libx264", "-pix_fmt", "yuv420p", str(src)], check=True)
-        response = self.client.post("/api/jobs", files={"file": ("clip.mp4", src.read_bytes(), "video/mp4")},
-                                    data={"effects": json.dumps([{"kind": "nr"}, {"kind": "fg", "factor": 2}])})
-        self.assertEqual(response.status_code, 201, response.text)
-        job = self._wait(response.json()["id"], timeout=600)
-        self.assertEqual(job["state"], "done", job.get("error"))
-        self.assertEqual(job["outputs"], ["result.mp4"])
-        from mlxdlss.video import probe
+        for effects in ([{"kind": "nr"}, {"kind": "fg", "factor": 2}], [{"kind": "fg", "factor": 2}, {"kind": "nr"}]):
+            response = self.client.post("/api/jobs", files={"file": ("clip.mp4", src.read_bytes(), "video/mp4")},
+                                        data={"effects": json.dumps(effects)})
+            self.assertEqual(response.status_code, 201, response.text)
+            job = self._wait(response.json()["id"], timeout=600)
+            self.assertEqual(job["state"], "done", job.get("error"))
+            self.assertEqual(job["outputs"], ["result.mp4"])
+            from mlxdlss.video import probe
 
-        info = probe(self.state.store.folder(job["id"]) / "result.mp4")
-        self.assertEqual(info.frame_count, 7)   # 4 frames -> 4 + 3 generated
-        self.assertAlmostEqual(info.fps, 20.0, places=3)
-        self.assertEqual(job["preview"], "preview.mp4")
-        self.assertEqual(self.client.get(f"/api/jobs/{job['id']}/preview").status_code, 200)
+            info = probe(self.state.store.folder(job["id"]) / "result.mp4")
+            self.assertEqual(info.frame_count, 7)   # 4 frames -> 4 + 3 generated
+            self.assertAlmostEqual(info.fps, 20.0, places=3)
+            self.assertEqual(job["preview"], "preview.mp4")
+            self.assertEqual(self.client.get(f"/api/jobs/{job['id']}/preview").status_code, 200)
