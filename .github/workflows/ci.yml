@@ -57,6 +57,9 @@ jobs:
           .build/ci-python/bin/python -m unittest \
             Tests/ToolsTests/test_neural_rendering_reference.py \
             Tests/ToolsTests/test_convert_neural_rendering_coreml.py
+          .build/ci-python/bin/python -m pip install './python[web,video]'
+          PYTHONPATH=python .build/ci-python/bin/python -m unittest \
+            python.tests.test_mlxdlss_stream
 
   python:
     name: Python package (${{ matrix.os }})

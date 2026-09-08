@@ -14,6 +14,10 @@ import DLSSMLX
 /// Protocol 2 adds bit 1 for an optional confidence plane after depth.
 /// Protocol 3 adds bit 2 to omit constant-one depth, and bits 3 / 4 for
 /// losslessly packed uint8 / uint16 RGB. Motion, confidence and output stay float32.
+/// Protocol 4 optionally appends source-size float32 RGB after the guides when
+/// --output-width/height differ from the input extent, and composes display RGB on Metal.
+/// With --framegen-weights it emits the first display frame immediately, then complete
+/// windows of generated and original frames interleaved, flushing the remainder at EOF.
 /// End of input ends the stream.
 enum StreamCommand {
   static let resetFlag: UInt32 = 1
@@ -43,7 +47,9 @@ enum StreamCommand {
         controlMaskIntensity: parsed.options.intensity,
         blendScale: parsed.blendScale,
         featureControls: parsed.options.featureControls,
-        geometry: parsed.options.geometry
+        geometry: parsed.options.geometry,
+        videoOutput: parsed.videoOutput,
+        frameGeneration: parsed.frameGeneration
       )
       : nil
     let input = FileHandle.standardInput
@@ -51,13 +57,15 @@ enum StreamCommand {
     var streamID: UInt64 = 1
     var frameIndex: UInt64 = 0
     var frames = 0
+    var outputFrames = 0
     let clock = ContinuousClock()
     let started = clock.now
-    let constantDepth = parsed.protocolVersion == 3 && parsed.mode == .temporal
+    let constantDepth = parsed.protocolVersion >= 3 && parsed.mode == .temporal
       ? try makeConstantDepth(width: width, height: height) : nil
     while let frame = try readFrame(
       from: input, width: width, height: height,
-      temporal: parsed.mode == .temporal, protocolVersion: parsed.protocolVersion, constantDepth: constantDepth
+      temporal: parsed.mode == .temporal, protocolVersion: parsed.protocolVersion, constantDepth: constantDepth,
+      outputWidth: parsed.videoOutput?.width, outputHeight: parsed.videoOutput?.height
     ) {
       let flags = frame.flags
       let color = frame.inputs[0]
@@ -65,38 +73,47 @@ enum StreamCommand {
         streamID += 1
         frameIndex = 0
       }
-      let rendered: HostTensor
       if let temporal {
         let request = try NeuralRenderRequest(
           sequenceID: frameIndex,
           temporalContext: NeuralRenderFrameContext(streamID: streamID, frameIndex: frameIndex),
           inputs: frame.inputs
         )
-        guard let result = try await temporal.render(request).output(named: "color") else {
-          throw CLIError.missingOutput("color")
+        if parsed.videoOutput != nil {
+          outputFrames += try await temporal.renderToStream(request, source: frame.source ?? color, to: output)
+        } else {
+          guard let result = try await temporal.render(request).output(named: "color") else {
+            throw CLIError.missingOutput("color")
+          }
+          try output.write(contentsOf: result.bytes)
+          outputFrames += 1
         }
-        rendered = result
       } else {
         guard let head else { throw CLIError.usage("stream: missing first-frame renderer") }
         var options = parsed.options
         options.noiseFrameIndex = UInt32(truncatingIfNeeded: frameIndex)
-        rendered = try await FirstFramePipeline.render(
+        let rendered = try await FirstFramePipeline.render(
           source: color,
           controlMask: nil,
           options: options,
           backend: head
         ).output
+        try output.write(contentsOf: rendered.bytes)
+        outputFrames += 1
       }
-      output.write(rendered.bytes)
       frameIndex += 1
       frames += 1
     }
+    if let temporal { outputFrames += try await temporal.finishStream(to: output) }
     let seconds = started.duration(to: clock.now)
     let summary: [String: Any] = [
       "frames": frames,
+      "output_frames": outputFrames,
       "mode": parsed.mode.rawValue,
       "seconds": Double(seconds.components.seconds) + Double(seconds.components.attoseconds) / 1e18,
       "shape": [height, width, 3],
+      "output_shape": [parsed.videoOutput?.height ?? height, parsed.videoOutput?.width ?? width, 3],
+      "gpu_framegen": parsed.frameGeneration != nil,
     ]
     let data = try JSONSerialization.data(withJSONObject: summary, options: [.sortedKeys])
     FileHandle.standardError.write(data)
@@ -106,13 +123,14 @@ enum StreamCommand {
   /// Decode and validate a whole frame before the renderer can consume it.
   static func readFrame(
     from handle: FileHandle, width: Int, height: Int,
-    temporal: Bool, protocolVersion: Int, constantDepth: HostTensor? = nil
-  ) throws -> (flags: UInt32, inputs: [HostTensor])? {
-    guard [1, 2, 3].contains(protocolVersion) else {
-      throw CLIError.usage("stream --protocol-version must be 1, 2 or 3")
+    temporal: Bool, protocolVersion: Int, constantDepth: HostTensor? = nil,
+    outputWidth: Int? = nil, outputHeight: Int? = nil
+  ) throws -> (flags: UInt32, inputs: [HostTensor], source: HostTensor?)? {
+    guard [1, 2, 3, 4].contains(protocolVersion) else {
+      throw CLIError.usage("stream --protocol-version must be 1, 2, 3 or 4")
     }
     guard let flags = try readWord(from: handle) else { return nil }
-    let knownFlags = protocolVersion == 3
+    let knownFlags = protocolVersion >= 3
       ? resetFlag | confidenceFlag | constantDepthFlag | uint8ColorFlag | uint16ColorFlag
       : (protocolVersion == 2 ? resetFlag | confidenceFlag : resetFlag)
     guard flags & ~knownFlags == 0 else {
@@ -154,7 +172,15 @@ enum StreamCommand {
       }
       return try tensor(named: name, data: data, height: height, width: width, channels: channels)
     }
-    return (flags, inputs)
+    var source: HostTensor?
+    if protocolVersion == 4, let outputWidth, let outputHeight,
+      outputWidth != width || outputHeight != height {
+      guard let data = try readExactly(outputWidth * outputHeight * 3 * 4, from: handle) else {
+        throw CLIError.usage("stream: truncated source frame")
+      }
+      source = try tensor(named: "source", data: data, height: outputHeight, width: outputWidth, channels: 3)
+    }
+    return (flags, inputs, source)
   }
 
   private static func makeConstantDepth(width: Int, height: Int) throws -> HostTensor {
@@ -214,6 +240,8 @@ enum StreamCommand {
     let protocolVersion: Int
     let blendScale: Float
     let options: FirstFrameOptions
+    let videoOutput: MLXVideoOutputOptions?
+    let frameGeneration: MLXVideoFrameGenerationOptions?
   }
 
   private static func parse(arguments: [String]) throws -> ParsedStream {
@@ -225,6 +253,8 @@ enum StreamCommand {
       "--local-tone", "--local-structure", "--skin-structure", "--auto-mask", "--intensity",
       "--network-geometry", "--depth-inverted", "--processing-scale", "--detail-strength",
       "--colour-strength", "--detail-radius", "--blend-scale", "--protocol-version",
+      "--output-width", "--output-height", "--output-format",
+      "--framegen-weights", "--framegen-precision", "--framegen-factor", "--framegen-batch",
     ]
     var values: [String: String] = [:]
     var index = 1
@@ -237,12 +267,13 @@ enum StreamCommand {
       index += 2
     }
     guard let widthText = values["--width"], let heightText = values["--height"],
-      let width = Int(widthText), let height = Int(heightText), width > 0, height > 0
+      let width = Int(widthText), let height = Int(heightText), width > 0, height > 0,
+      height <= Int(Int32.max) / 16, width <= Int(Int32.max) / height / 16
     else {
       throw CLIError.usage("stream requires positive --width and --height")
     }
-    guard let protocolVersion = Int(values["--protocol-version"] ?? "1"), [1, 2, 3].contains(protocolVersion) else {
-      throw CLIError.usage("stream --protocol-version must be 1, 2 or 3")
+    guard let protocolVersion = Int(values["--protocol-version"] ?? "1"), [1, 2, 3, 4].contains(protocolVersion) else {
+      throw CLIError.usage("stream --protocol-version must be 1, 2, 3 or 4")
     }
     let blendScale = try floatOption("--blend-scale", values: values, default: 0.739_746_093_75)
     let mode = try enumeration(Mode.self, values["--mode"], default: .temporal, message: "stream mode must be 'temporal' or 'first-frame'")
@@ -280,6 +311,37 @@ enum StreamCommand {
     if mode == .temporal, processingScale != 1 {
       throw CLIError.usage("stream temporal mode runs at the native scale")
     }
+    let videoKeys = ["--output-width", "--output-height", "--output-format",
+                     "--framegen-weights", "--framegen-precision", "--framegen-factor", "--framegen-batch"]
+    if videoKeys.contains(where: { values[$0] != nil }) && (protocolVersion != 4 || mode != .temporal) {
+      throw CLIError.usage("stream GPU video output requires temporal mode and --protocol-version 4")
+    }
+    if protocolVersion == 4 && mode != .temporal {
+      throw CLIError.usage("stream --protocol-version 4 requires temporal mode")
+    }
+    var videoOutput: MLXVideoOutputOptions?
+    var frameGeneration: MLXVideoFrameGenerationOptions?
+    if protocolVersion == 4 {
+      guard let outputWidth = Int(values["--output-width"] ?? String(width)),
+        let outputHeight = Int(values["--output-height"] ?? String(height)),
+        outputWidth > 0, outputHeight > 0, outputWidth <= width, outputHeight <= height,
+        detailRadius > 0, detailRadius < Float(Int32.max / 6),
+        let format = MLXVideoOutputOptions.Format(rawValue: values["--output-format"] ?? "f32")
+      else { throw CLIError.usage("stream: invalid output dimensions, output format or detail radius") }
+      videoOutput = try MLXVideoOutputOptions(width: outputWidth, height: outputHeight,
+        detailStrength: detailStrength, colourStrength: colourStrength, radius: detailRadius, format: format)
+      if let weights = values["--framegen-weights"] {
+        guard let factor = Int(values["--framegen-factor"] ?? "2"), factor >= 2,
+          let batch = Int(values["--framegen-batch"] ?? "4"), batch >= 1,
+          factor <= Int(Int32.max) / batch,
+          let precision = FrameGenerator.Precision(rawValue: values["--framegen-precision"] ?? "float16")
+        else { throw CLIError.usage("stream: invalid framegen factor, batch or precision") }
+        frameGeneration = try MLXVideoFrameGenerationOptions(weightsURL: URL(fileURLWithPath: weights),
+          precision: precision, factor: factor, batch: batch)
+      } else if videoKeys.filter({ $0.hasPrefix("--framegen-") }).contains(where: { values[$0] != nil }) {
+        throw CLIError.usage("stream: framegen options require --framegen-weights")
+      }
+    }
     var depthInverted = false
     if let text = values["--depth-inverted"] {
       guard let parsed = Bool(text) else { throw CLIError.usage("stream --depth-inverted must be true or false") }
@@ -316,7 +378,9 @@ enum StreamCommand {
     )
     return ParsedStream(
       modelURL: URL(fileURLWithPath: modelPath), width: width, height: height, mode: mode,
-      executionMode: executionMode, computePrecision: computePrecision, depthInverted: depthInverted, protocolVersion: protocolVersion, blendScale: blendScale, options: options
+      executionMode: executionMode, computePrecision: computePrecision, depthInverted: depthInverted,
+      protocolVersion: protocolVersion, blendScale: blendScale, options: options,
+      videoOutput: videoOutput, frameGeneration: frameGeneration
     )
   }
 

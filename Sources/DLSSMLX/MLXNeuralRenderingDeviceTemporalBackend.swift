@@ -27,6 +27,7 @@ public actor MLXNeuralRenderingDeviceTemporalBackend: NeuralRenderBackend {
   private var history: MLXArray?
   private var noiseFrameIndex: UInt32 = 0
   private var extensionIndices: (geometry: NeuralRenderingNetworkGeometry, rows: MLXArray, columns: MLXArray)?
+  private let videoOutput: MLXVideoOutput?
 
   /// - Parameter geometry: how logical frames map onto the network extent.
   ///   `vendorAligned` (default) pads every frame to the recovered minimum
@@ -42,8 +43,13 @@ public actor MLXNeuralRenderingDeviceTemporalBackend: NeuralRenderBackend {
     controlMaskIntensity: Float = 1,
     blendScale: Float = 0.739_746_093_75,
     featureControls: NeuralRenderingFeatureControls = .init(),
-    geometry: NeuralRenderingNetworkGeometryPolicy = .vendorAligned
+    geometry: NeuralRenderingNetworkGeometryPolicy = .vendorAligned,
+    videoOutput: MLXVideoOutputOptions? = nil,
+    frameGeneration: MLXVideoFrameGenerationOptions? = nil
   ) throws {
+    guard frameGeneration == nil || videoOutput != nil else {
+      throw NeuralRenderingDetailComposition.Error.unsupportedTensor("frame generation requires video output options")
+    }
     let package = try ModelPackageLoader.load(url: packageURL)
     guard MLXNeuralRenderer.transformerArchitectures.contains(package.manifest.architecture) else {
       throw MLXBackendError.unsupportedArchitecture(package.manifest.architecture)
@@ -61,9 +67,33 @@ public actor MLXNeuralRenderingDeviceTemporalBackend: NeuralRenderBackend {
     self.featureControls = featureControls
     self.geometryPolicy = geometry
     self.postprocessor = MLXTemporalPostprocessor(blendScale: blendScale)
+    self.videoOutput = try videoOutput.map { try MLXVideoOutput(options: $0, frameGeneration: frameGeneration) }
   }
 
   public func render(_ request: NeuralRenderRequest) async throws -> NeuralRenderResult {
+    let result = try await renderDevice(request)
+    return try NeuralRenderResult(
+      outputs: [hostTensor(result.output, shape: result.output.shape)],
+      timing: NeuralRenderTiming(executionNanoseconds: result.nanoseconds)
+    )
+  }
+
+  /// Write final display frames without exposing the intermediate MLX arrays outside this actor.
+  public func renderToStream(_ request: NeuralRenderRequest, source: HostTensor, to output: FileHandle) async throws -> Int {
+    guard let videoOutput else {
+      throw NeuralRenderingDetailComposition.Error.unsupportedTensor("video output is not configured")
+    }
+    try validate(source, name: "source", channels: 3,
+      expectedSpatialShape: [1, videoOutput.options.height, videoOutput.options.width])
+    let result = try await renderDevice(request, evaluateOutput: false)
+    return try videoOutput.push(result.output, source: array(source), to: output)
+  }
+
+  public func finishStream(to output: FileHandle) throws -> Int {
+    try videoOutput?.finish(to: output) ?? 0
+  }
+
+  private func renderDevice(_ request: NeuralRenderRequest, evaluateOutput: Bool = true) async throws -> (output: MLXArray, nanoseconds: UInt64) {
     guard let context = request.temporalContext else {
       throw TemporalLifecycleError.missingFrameContext
     }
@@ -219,18 +249,14 @@ public actor MLXNeuralRenderingDeviceTemporalBackend: NeuralRenderBackend {
         controlMask: controlMaskArray,
         intensity: controlMaskIntensity
       )
-      eval(output)
+      if evaluateOutput { eval(output) }
       let executionNanoseconds = nanoseconds(
         in: started.duration(to: ContinuousClock.now)
       )
-      let outputTensor = try hostTensor(output, shape: color.descriptor.shape)
       history = stopGradient(output)
       noiseFrameIndex &+= 1
       tracker.commit(context: context, inputDescriptors: descriptors)
-      return try NeuralRenderResult(
-        outputs: [outputTensor],
-        timing: NeuralRenderTiming(executionNanoseconds: executionNanoseconds)
-      )
+      return (output, executionNanoseconds)
     } catch {
       tracker.markInferenceFailure(frameIndex: context.frameIndex)
       throw error

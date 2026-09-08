@@ -55,7 +55,17 @@ class NeuralRenderStage:
         self.pipeline, self.options = pipeline, options
         self.scene_cuts = 0
 
-    def apply(self, frames, width, height, *, prefetch=False, cancel=lambda: None):
+    def can_generate_on_device(self, following):
+        if not (self.options.backend == "mlxdlss" and self.options.temporal and
+                isinstance(following, FrameGenerationStage) and following.options.backend == "mlxdlss" and
+                following.floating):
+            return False
+        from .mlxdlss_stream import find_mlxdlss
+
+        return Path(find_mlxdlss(self.options.mlxdlss)).resolve() == Path(find_mlxdlss(following.options.mlxdlss)).resolve()
+
+    def apply(self, frames, width, height, *, prefetch=False, cancel=lambda: None,
+              framegen=None, output_format="f32"):
         options, enhance = self.options, self.options.enhance
         stream = renderer = prepared = None
         try:
@@ -64,11 +74,18 @@ class NeuralRenderStage:
 
                 if not options.model_package:
                     raise VideoToolError("backend 'mlxdlss' needs --model MODEL.dlssmodel")
+                native_fg = {}
+                if framegen is not None:
+                    if not framegen.mlxdlss_weights:
+                        raise VideoToolError("the mlxdlss backend needs mlxdlss_weights")
+                    native_fg = dict(framegen_weights=framegen.mlxdlss_weights, framegen_factor=framegen.factor,
+                                     framegen_batch=max(1, int(framegen.batch)), framegen_precision=framegen.mlxdlss_precision,
+                                     output_format=output_format)
                 stream = MLXDLSSStreamSession(
                     options.model_package, width, height, temporal=options.temporal, motion=options.motion,
                     scene_cut_threshold=options.scene_cut_threshold, robust_motion=options.robust_motion,
                     blend_scale=options.blend_scale, mlxdlss=options.mlxdlss, execution=options.execution,
-                    precision=options.precision, **enhance,
+                    precision=options.precision, **enhance, **native_fg,
                 )
                 renderer = stream
             elif options.temporal:
@@ -96,7 +113,12 @@ class NeuralRenderStage:
                 else:
                     prepared = sequential()
                 for frame in prepared:
-                    yield renderer._process_prepared(frame)
+                    if framegen is not None:
+                        yield from stream.push_prepared(frame)
+                    else:
+                        yield renderer._process_prepared(frame)
+                if framegen is not None:
+                    yield from stream.finish()
                 self.scene_cuts = renderer.scene_cuts
             elif stream is not None:
                 for frame in frames:
@@ -264,8 +286,19 @@ def run_video(source, destination, stages, options, *, ffmpeg=None, ffprobe=None
             encoder = subprocess.Popen(encode, stdin=subprocess.PIPE, stderr=encode_error)
             frames = read_frames()
             iterators.append(frames)
-            for stage in stages:
-                frames = stage.apply(frames, info.width, info.height, prefetch=True, cancel=abort_decode)
+            index = 0
+            while index < len(stages):
+                stage = stages[index]
+                if (isinstance(stage, NeuralRenderStage) and index + 1 < len(stages) and
+                        stage.can_generate_on_device(stages[index + 1])):
+                    # Quantize only at the final encoder boundary. Intermediate NR -> FG stays float32 on Metal.
+                    output_format = ("u8" if options.pixel_format == "rgb24" else "u16") if index + 2 == len(stages) else "f32"
+                    frames = stage.apply(frames, info.width, info.height, prefetch=True, cancel=abort_decode,
+                                         framegen=stages[index + 1].options, output_format=output_format)
+                    index += 2
+                else:
+                    frames = stage.apply(frames, info.width, info.height, prefetch=True, cancel=abort_decode)
+                    index += 1
                 iterators.append(frames)
             for frame in frames:
                 if not progress_input and should_stop is not None and should_stop():

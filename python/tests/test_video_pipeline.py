@@ -3,6 +3,7 @@ import unittest
 import pathlib
 import shutil
 import tempfile
+from unittest.mock import patch
 
 import numpy as np
 
@@ -14,6 +15,22 @@ from .test_video_temporal_quality import ProbePipeline
 
 
 class VideoPipelineTests(unittest.TestCase):
+    def test_device_chain_selection_preserves_backend_order_and_float_contract(self):
+        from mlxdlss.framegen_video import FrameGenOptions
+
+        nr = NeuralRenderStage(None, ConvertOptions(backend="mlxdlss", mlxdlss="/native"))
+        fg = FrameGenerationStage(None, FrameGenOptions(backend="mlxdlss", mlxdlss="/native"), floating=True)
+        with patch("mlxdlss.mlxdlss_stream.find_mlxdlss", side_effect=lambda path: path):
+            self.assertTrue(nr.can_generate_on_device(fg))
+            self.assertFalse(nr.can_generate_on_device(nr))
+            for field, value in (("backend", "torch"), ("mlxdlss", "/another")):
+                with patch.object(fg.options, field, value):
+                    self.assertFalse(nr.can_generate_on_device(fg))
+            with patch.object(fg, "floating", False):
+                self.assertFalse(nr.can_generate_on_device(fg))
+            with patch.object(nr.options, "temporal", False):
+                self.assertFalse(nr.can_generate_on_device(fg))
+
     def test_prefetch_preserves_temporal_outputs_cuts_and_frame_order(self):
         rng = np.random.default_rng(27)
         dark = rng.random((17, 19, 3), dtype=np.float32) * 0.2

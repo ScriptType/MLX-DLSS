@@ -138,9 +138,14 @@ the host work with the GPU: with `--batch 1` the server waits for the host
 after every frame.
 Standalone FG uses uint8 RGB in both pipe directions (`--format u8`, the
 default), which took the host side of the stream from 22 ms to under 2 ms per
-540p frame; the frames are converted on the GPU. The web NR/FG chain uses
-`--format f32` in either effect order to preserve fractional detail between
-models, with one decode and one final encode.
+540p frame; the frames are converted on the GPU. The web chain keeps float32
+between models, with one decode and one final encode. Temporal Metal NR → FG
+uses `mlxdlss stream --protocol-version 4 --framegen-weights ...` in one process:
+downscale/detail composition and the FG input window remain on Metal, with
+final RGB8/RGB16 packing at the encoder boundary. The first original is emitted
+immediately; each complete window emits generated frames followed by its next
+original, and EOF flushes the remaining pairs. History resets preserve the FG
+pair sequence. FG → NR and mixed backends use the float32 host bridge.
 
 Each convolution runs as one Metal kernel with the bias, the clamped
 LeakyReLU, the residual add and the 2×2 mean pool in its epilogue (the three
@@ -151,6 +156,32 @@ batches the same way (`FrameGenerator.generate` and `generate_pairs`).
 Accuracy: the two ports agree within `1e-7` MAE at float32 and `1.3e-5` at
 float16 on real weights (a full 960×540 frame); a batched result equals the
 one-frame result exactly at float32 and within float16 rounding on MPS.
+
+## GPU video chain
+
+Paired release measurements against `707d328`, M2 Max, real NR and FG weights,
+512×384 video frames, float16 inference, NR detail strength 2, four FG pairs per
+batch. Times are the mean per **input frame** over 16 frames after five warm-up
+frames, including both models, display composition and float32 pipe I/O;
+decode, encode and CPU motion preparation are excluded.
+
+| NR processing scale | FG factor | separate processes + CPU display | GPU display + shared NR → FG |
+| --- | --- | --- | --- |
+| 1 | 2 | 43.17–45.05 ms | 40.39–43.83 ms |
+| 2 | 4 | 158.05–165.32 ms | 140.87–152.42 ms |
+
+Desktop load varies: a later scale-4 comparison drifted substantially even
+between baseline runs, so it does not establish a chain speedup at that scale.
+The default final-encoder path additionally packs RGB8/RGB16 on Metal; float32
+remains intact between the models. On the tested real-weight sequences the
+GPU display recipe differed from CPU composition by at most `2.4e-7`. Passing
+those differences through float16 FG produced a maximum RGB difference of
+`3.34e-4`, mean at most `8.1e-7`; final RGB8 differed by one code value in fewer
+than `0.021%` of channel values. Checkpoints and inference precision are unchanged.
+Synthetic integration tests also compare the shared path against separate
+GPU-display/FG processes exactly, covering both model precisions, empty and
+single-frame input, scene resets, multi-phase batches, short EOF windows,
+RGB8/RGB16 output, audio/rate preservation and cancellation.
 
 ## Not ported
 

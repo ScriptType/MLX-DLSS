@@ -73,6 +73,37 @@ Consecutive `frameIndex` values keep the display history; a gap, a stream
 change or a reset request clears it. `NeuralRenderingTemporalReferencePreprocessor.normalizePixelMotion`
 converts engine pixel motion with its scale and jitter.
 
+## Metal video output and frame generation
+
+`MLXNeuralRenderingDeviceTemporalBackend` can compose display RGB and generate
+intermediate frames inside its actor, keeping the float32 NR → FG arrays on
+the GPU. The portable `render()` method still returns the original full-size
+`HostTensor`; opt into the streaming output separately:
+
+```swift
+import Foundation
+
+let video = try MLXNeuralRenderingDeviceTemporalBackend(
+  packageURL: modelPackageURL, executionMode: .metalFused, computePrecision: .float16,
+  videoOutput: MLXVideoOutputOptions(width: outputWidth, height: outputHeight,
+                                   detailStrength: 2, format: .u8),
+  frameGeneration: MLXVideoFrameGenerationOptions(weightsURL: frameGenerationWeightsURL,
+                                                precision: .float16, factor: 2, batch: 4)
+)
+// Call sequentially for each input frame; request contains processing-size RGB and guides.
+let written = try await video.renderToStream(request, source: originalColor, to: destination)
+// Once, at end of input, emit any remaining generated/original pairs.
+let finalWritten = try await video.finishStream(to: destination)
+```
+
+`originalColor` is a float32 NHWC `HostTensor` at the configured output extent;
+`destination` is a writable `FileHandle`. The output is raw RGB in the selected
+`.f32`, `.u8`, or `.u16` format. Omit `frameGeneration` for one display frame per
+input. With FG, calls can write zero or several frames: one first original,
+then batches of generated/original frames in order. Keep one actor per video,
+and drain `finishStream` before closing the output. Temporal resets affect NR
+history while retaining the consecutive FG pairs, matching the video adapter.
+
 ## Fixed-shape Core ML head
 
 ```swift
@@ -91,7 +122,8 @@ recovered graph changes; the MLX path applies such fixes at load time.
 
 ## Performance expectations
 
-With `metalFused` float16 on an M2 Max a `1920×1080` frame takes about one
-second, `3840×2160` about nine, `320×320` a quarter of a second (see the
-README). Real-time use means a proxy processing size or a fixed-shape Core ML
-head, not native 4K.
+Use the [paired measurements in the README](../README.md#accuracy-and-speed)
+for the current Metal path. Processing scale increases the network's pixel
+count quadratically; moving display composition and NR → FG onto Metal reduces
+transfer and CPU work while preserving that model cost. Measure the complete
+frame loop at the intended extent, precision and output format.

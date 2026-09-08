@@ -126,9 +126,12 @@ current-to-previous UV offsets and an optional H×W×1 confidence map in [0, 1].
 Motion preparation for the next frame overlaps GPU rendering by default;
 `--no-prefetch` disables the overlap for comparison. History and scene resets
 still advance in frame order. Metal temporal video requires rebuilding the
-Swift binary for stream protocol 3 (versions 1 and 2 remain accepted). Unscaled
+Swift binary for stream protocol 4 (versions 1–3 remain accepted). Unscaled
 8/16-bit source RGB uses its original integer format on the pipe; resampled
-RGB, motion, confidence and returned RGB stay float32. Constant depth is reused.
+RGB, motion and confidence stay float32. Constant depth is reused. Downscale
+and detail/colour composition now run on Metal before returning source-size
+float32 RGB; at processing scale 4, the returned RGB payload is 16 times smaller.
+History stays at the processing extent, before display composition.
 
 Default
 encoding: `-c:v libx264 -crf 18 -preset medium -pix_fmt yuv420p -movflags +faststart`;
@@ -152,6 +155,10 @@ and still images keep their existing behavior. Completed video jobs show the
 temporal reset count and processing scale.
 Video effects share one decoder and one encoder in either order, with float32
 frames between effects; no intermediate MP4 is created.
+With both effects on Metal, temporal NR → FG automatically uses one native
+process: float32 display frames pass directly into FG as MLX arrays. The final
+frames are packed as RGB8 or RGB16 on Metal for the encoder. FG → NR, independent
+NR frames, and mixed backends keep the existing float32 host path.
 HTTP API: `GET /api/effects`, `POST /api/jobs` (multipart `file` + JSON
 `effects`), `GET /api/jobs[/{id}]`, `POST /api/jobs/{id}/cancel`,
 `GET /api/jobs/{id}/output/{n}` (inline), `GET /api/jobs/{id}/download/{n}`,
@@ -217,6 +224,18 @@ prefetch on/off was bit-exact. Checkpoints, history and model precision are
 unchanged. NR reuses scratch allocations within global-attention and FFN
 stages while retaining the existing evaluation barriers and releasing the
 cache at stage exit.
+
+The GPU display/NR → FG path was also measured against `707d328` on M2 Max,
+with the same real weights and 512×384 frames, float16 inference and detail
+strength 2. Temporal NR including display composition and pipe I/O took
+`133–138 ms` per input at processing scale 2 (previously `149 ms`), and
+`418–420 ms` at scale 4 (previously `525–593 ms`). These are warm means over
+16 frames after five warm-up frames, excluding decode, encode and motion
+preparation. NR display differences stayed below `2.4e-7` in these runs.
+See [NR → FG measurements](docs/frame-generation.md#gpu-video-chain) for the
+combined path and its numerical comparison.
+NR's fused blocks require float16; `--precision float32` keeps the reference
+MLX graph even when `--execution metal-fused` is selected.
 
 Not included: DLSS Super Resolution (measured, loses to Lanczos on realistic
 content without engine motion vectors and jitter; see the note below) and the

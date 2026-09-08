@@ -58,7 +58,7 @@ final class CLITests: XCTestCase {
 
   func testStreamRejectsUnknownProtocolAndNonfiniteBlendScaleBeforeOpeningModel() throws {
     for options in [
-      ["--protocol-version", "4"], ["--protocol-version", "x"], ["--blend-scale", "nan"],
+      ["--protocol-version", "5"], ["--protocol-version", "x"], ["--blend-scale", "nan"],
     ] {
       let result = try runCLI(
         ["stream", "/definitely/missing/model.dlssmodel", "--width", "1", "--height", "1"] + options
@@ -116,7 +116,7 @@ final class CLITests: XCTestCase {
       (streamPayload(flags: 2, values: valid), true, 1),
       (streamPayload(flags: 4, values: valid), true, 2),
       (streamPayload(flags: 2, values: valid), false, 2),
-      (streamPayload(flags: 0, values: valid), true, 4),
+      (streamPayload(flags: 0, values: valid), true, 5),
       (streamPayload(flags: 24, values: valid), true, 3),
       (streamPayload(flags: 4, values: valid), false, 3),
       (streamPayload(flags: 32, values: valid), true, 3),
@@ -176,6 +176,52 @@ final class CLITests: XCTestCase {
         }
       }
     }
+  }
+
+  func testVideoOutputProtocolConsumesSourceAfterGuidesAndRejectsTruncation() throws {
+    let fields: [Float] = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0, 0, 0, 0, 0.75, 1, 0.5001, 0.6, 0.7]
+    let payload = streamPayload(flags: 6, values: fields)
+    try withInputPipe(payload + payload) { handle in
+      for _ in 0..<2 {
+        let frame = try XCTUnwrap(StreamCommand.readFrame(from: handle, width: 2, height: 1,
+          temporal: true, protocolVersion: 4, outputWidth: 1, outputHeight: 1))
+        XCTAssertEqual(frame.inputs.map { $0.descriptor.name }, ["color", "motion", "depth", "historyConfidence"])
+        XCTAssertEqual(frame.source?.descriptor.shape, [1, 1, 1, 3])
+        XCTAssertEqual(frame.source?.bytes, Array(fields.suffix(3)).withUnsafeBytes { Data($0) })
+      }
+      XCTAssertNil(try StreamCommand.readFrame(from: handle, width: 2, height: 1,
+        temporal: true, protocolVersion: 4, outputWidth: 1, outputHeight: 1))
+    }
+    for length in (payload.count - 12)..<payload.count {
+      try withInputPipe(Data(payload.prefix(length))) { handle in
+        XCTAssertThrowsError(try StreamCommand.readFrame(from: handle, width: 2, height: 1,
+          temporal: true, protocolVersion: 4, outputWidth: 1, outputHeight: 1))
+      }
+    }
+    var malformed = fields
+    malformed[12] = .nan
+    try withInputPipe(streamPayload(flags: 6, values: malformed)) { handle in
+      XCTAssertThrowsError(try StreamCommand.readFrame(from: handle, width: 2, height: 1,
+        temporal: true, protocolVersion: 4, outputWidth: 1, outputHeight: 1))
+    }
+  }
+
+  func testVideoOutputOptionsFailBeforeOpeningModel() throws {
+    for options in [
+      ["--output-width", "0"], ["--output-height", "3"], ["--output-format", "rgb"],
+      ["--detail-radius", "0"], ["--framegen-factor", "2"],
+      ["--framegen-weights", "missing", "--framegen-factor", "1"],
+      ["--framegen-weights", "missing", "--framegen-batch", "0"],
+      ["--framegen-weights", "missing", "--framegen-precision", "int8"],
+      ["--mode", "first-frame"],
+    ] {
+      let result = try runCLI(["stream", "/missing/model", "--width", "2", "--height", "2", "--protocol-version", "4"] + options)
+      XCTAssertEqual(result.status, 2)
+      XCTAssertTrue(result.stderr.contains("stream"), result.stderr)
+      XCTAssertFalse(result.stderr.contains("packageIsNotDirectory"), result.stderr)
+    }
+    let legacy = try runCLI(["stream", "/missing/model", "--width", "2", "--height", "2", "--output-format", "u8"])
+    XCTAssertTrue(legacy.stderr.contains("--protocol-version 4"), legacy.stderr)
   }
 
   func testExternalStreamRejectsBadConfidenceWithoutOutputOrHungProcess() throws {

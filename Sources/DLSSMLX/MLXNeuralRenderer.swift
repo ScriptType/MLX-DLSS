@@ -90,7 +90,9 @@ public actor MLXNeuralRenderer: NeuralRenderBackend {
       model = .neuralRenderingTransformer(
         try NeuralRenderingTransformerModel(
           weights: weights,
-          compileBlocks: executionMode == .metalFused,
+          // Fused NR blocks publish half values and require float16 inputs.
+          // Keep the reference MLX graph for float32 instead of trapping or reducing precision.
+          compileBlocks: executionMode == .metalFused && computePrecision == .float16,
           quantizeGlobalFFN: executionMode == .int8Fast
         )
       )

@@ -670,6 +670,14 @@ public final class FrameGenerator {
   }
 
   private func interpolate(_ a: MLXArray, _ b: MLXArray, phases: [Float], rgb8: Bool) throws -> MLXArray {
+    var out = try interpolationGraph(a, b, phases: phases)
+    if rgb8 { out = (out * 255 + 0.5).asType(.uint8) }
+    eval(out)
+    return out
+  }
+
+  /// Internal device composition can append output packing before the evaluation boundary.
+  func interpolationGraph(_ a: MLXArray, _ b: MLXArray, phases: [Float]) throws -> MLXArray {
     try check(a, b)
     guard !phases.isEmpty else { throw Error(description: "at least one phase is needed") }
     var aa = a, bb = b
@@ -679,10 +687,7 @@ public final class FrameGenerator {
     }
     guard aa.dim(0) == phases.count else { throw Error(description: "\(phases.count) phases for \(aa.dim(0)) frame pairs") }
     let export = synthesize(aa, bb, phases: MLXArray(phases))
-    var out = Self.compose(aa.asType(.float32), bb.asType(.float32), coarse: export, sigmoidMask: true)
-    if rgb8 { out = (out * 255 + 0.5).asType(.uint8) }
-    eval(out)
-    return out
+    return Self.compose(aa.asType(.float32), bb.asType(.float32), coarse: export, sigmoidMask: true)
   }
 
   /// The single frame `[1, H, W, 3]` between `a` and `b` at `phase`.

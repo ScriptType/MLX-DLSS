@@ -32,7 +32,21 @@ jobs retain their explicit settings. See the repository README for controls.
 
 Temporal video prepares one following frame on a CPU worker while rendering
 the current frame (`--no-prefetch` disables this). The Metal adapter uses stream
-protocol 3, so rebuild the Swift binary when updating Python. The web effect
+protocol 4, so rebuild the Swift binary when updating Python. The web effect
 chain decodes and encodes once and preserves float32 frames between NR and FG
-in both orders. OpenCV also accelerates the existing detail filter; the base
-image installation retains its NumPy fallback.
+in both orders. Metal temporal NR performs downscale and detail composition on
+the GPU, after retaining its processing-size history. A following Metal FG
+stage uses those MLX arrays in the same process; only final frames return to
+Python, packed for the encoder. This path requires both stages to resolve to
+the same Swift binary. Other effect orders and backends retain their existing
+float32 host path. OpenCV accelerates CPU detail filtering; the base image
+installation retains its NumPy fallback.
+
+`MLXDLSSStreamSession(..., protocol_version=3)` retains the CPU display recipe
+for comparisons. Protocol 4 accepts `framegen_weights`, `framegen_factor`,
+`framegen_batch`, `framegen_precision`, and `output_format="f32"|"u8"|"u16"`.
+With FG enabled, use `push_prepared()` for prepared temporal frames and drain
+`finish()` at EOF: the first frame is returned immediately, then complete
+windows of generated/original frames in order, including the last short window.
+`close()` drains any unread final window and releases the process; `abort()`
+terminates it on cancellation or failure.

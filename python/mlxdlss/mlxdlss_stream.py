@@ -7,10 +7,14 @@ input frame. Protocol 2 adds flag bit 1 for an optional float32 H×W×1 history
 confidence plane after depth; the temporal adapter explicitly requests it.
 Protocol 3 adds bit 2 to omit constant-one depth and bits 3/4 for packed
 uint8/uint16 RGB when the source is integral and no resampling is needed.
+Protocol 4 composes source-size display RGB on Metal. When the processing extent
+differs, source float32 RGB follows the guides. Optional native FG returns the
+first frame immediately, then interleaved generated/original frames per window.
 """
 from __future__ import annotations
 
 import json
+import math
 import shutil
 import struct
 import subprocess
@@ -46,10 +50,26 @@ class MLXDLSSStreamSession:
                  profile: str = "standard", intensity: float = 1.0, execution: str = "metal-fused",
                  precision: str = "float16", processing_scale: float = 1.0, detail_strength: float = 1.0,
                  colour_strength: float = 1.0, detail_radius: float = 4.0, blend_scale: float = BLEND_SCALE,
-                 robust_motion: bool = True, protocol_version: int = 3):
-        if protocol_version not in (2, 3):
-            raise ValueError("protocol_version must be 2 or 3")
+                 robust_motion: bool = True, protocol_version: int = 4,
+                 framegen_weights: str | Path | None = None, framegen_factor: int = 2,
+                 framegen_batch: int = 4, framegen_precision: str = "float16", output_format: str = "f32"):
+        if protocol_version not in (2, 3, 4):
+            raise ValueError("protocol_version must be 2, 3 or 4")
+        if not temporal and protocol_version == 4:
+            protocol_version = 3
         self.protocol_version = protocol_version
+        if not all(math.isfinite(x) for x in (detail_strength, colour_strength, detail_radius)) or detail_radius <= 0:
+            raise ValueError("strengths and radius must be finite; radius must be positive")
+        if output_format not in ("f32", "u8", "u16"):
+            raise ValueError("output format must be f32, u8 or u16")
+        if (framegen_weights is not None or output_format != "f32") and (not temporal or protocol_version != 4):
+            raise ValueError("GPU frame generation and packed output require temporal protocol 4")
+        if framegen_weights is not None and (framegen_factor < 2 or framegen_batch < 1):
+            raise ValueError("frame generation requires factor >= 2 and batch >= 1")
+        self.framegen_factor = framegen_factor if framegen_weights is not None else 1
+        self.framegen_batch = framegen_batch
+        self.pending_pairs = 0
+        self.output_dtype = np.dtype({"f32": "<f4", "u8": "u1", "u16": "<u2"}[output_format])
         if not 1 <= processing_scale <= 4:
             raise ValueError("processing_scale must be within [1, 4]")
         if width <= 0 or height <= 0:
@@ -75,6 +95,13 @@ class MLXDLSSStreamSession:
                    "--precision", precision, "--profile", profile, "--intensity", str(intensity)]
         if temporal:
             command += ["--protocol-version", str(protocol_version), "--blend-scale", str(blend_scale)]
+            if protocol_version == 4:
+                command += ["--output-width", str(width), "--output-height", str(height),
+                            "--detail-strength", str(detail_strength), "--colour-strength", str(colour_strength),
+                            "--detail-radius", str(detail_radius), "--output-format", output_format]
+                if framegen_weights is not None:
+                    command += ["--framegen-weights", str(framegen_weights), "--framegen-factor", str(framegen_factor),
+                                "--framegen-batch", str(framegen_batch), "--framegen-precision", framegen_precision]
         else:
             command += ["--processing-scale", str(processing_scale), "--detail-strength", str(detail_strength),
                         "--colour-strength", str(colour_strength), "--detail-radius", str(detail_radius)]
@@ -87,7 +114,7 @@ class MLXDLSSStreamSession:
         self.previous: np.ndarray | None = None
         self.frame_index = self.scene_cuts = self.frames = 0
         self._reset_pending = False
-        self._closed = False
+        self._closed = self._finished = False
         self._summary = {}
         self._depth = (np.ones((self.processing_height, self.processing_width, 1), dtype="<f4").tobytes()
                        if temporal and protocol_version == 2 else None)
@@ -115,7 +142,18 @@ class MLXDLSSStreamSession:
         return self._process_prepared(prepare_temporal_frame(frame, estimate, self.processing_scale))
 
     def _process_prepared(self, prepared) -> np.ndarray:
-        if self._closed:
+        if self.framegen_factor != 1:
+            raise RuntimeError("use push_prepared for a frame-generation stream")
+        output = self.push_prepared(prepared)[0]
+        if self.temporal and self.protocol_version < 4:
+            detail, colour, radius = self.detail
+            output = compose_detail(prepared.source, resample(output, self.width, self.height),
+                                    detail_strength=detail, colour_strength=colour, radius=radius)
+        return output
+
+    def push_prepared(self, prepared) -> list[np.ndarray]:
+        """Send prepared NR inputs; return final frames when the native FG window completes."""
+        if self._closed or self._finished:
             raise RuntimeError("mlxdlss stream is closed")
         frame = prepared.source
         flags = RESET_FLAG if self._reset_pending or prepared.reset else 0
@@ -127,7 +165,7 @@ class MLXDLSSStreamSession:
         if confidence is not None:
             flags |= 2
         color_dtype = "<f4"
-        if self.temporal and self.protocol_version == 3:
+        if self.temporal and self.protocol_version >= 3:
             flags |= 4
             if prepared.packed_color is not None:
                 processing = prepared.packed_color
@@ -140,19 +178,19 @@ class MLXDLSSStreamSession:
                 payload.append(self._depth)
             if confidence is not None:
                 payload.append(memoryview(np.ascontiguousarray(confidence, dtype="<f4")).cast("B"))
+        if self.protocol_version == 4 and (width, height) != (self.width, self.height):
+            payload.append(memoryview(np.ascontiguousarray(frame, dtype="<f4")).cast("B"))
         try:
             for field in payload:
                 self.process.stdin.write(field)
             self.process.stdin.flush()
-            expected = height * width * 3 * 4
-            data = bytearray(expected)
-            view = memoryview(data)
-            received = 0
-            while received < expected:
-                count = self.process.stdout.readinto(view[received:])
-                if not count:
-                    raise RuntimeError(f"mlxdlss stream ended early (rebuild the binary if its protocol is outdated): {self._error_text()}")
-                received += count
+            count = 1
+            if self.framegen_factor > 1 and self.frames > 0:
+                self.pending_pairs += 1
+                count = self.pending_pairs * self.framegen_factor if self.pending_pairs == self.framegen_batch else 0
+            outputs = self._read_outputs(count)
+            if count:
+                self.pending_pairs = 0
         except (BrokenPipeError, OSError) as error:
             detail = self._error_text()
             self.abort()
@@ -160,16 +198,43 @@ class MLXDLSSStreamSession:
         except BaseException:
             self.abort()
             raise
-        output = np.frombuffer(data, dtype="<f4").reshape(height, width, 3)
         self.previous = frame.copy()
         self.frame_index = 1 if flags & RESET_FLAG else self.frame_index + 1
         self.frames += 1
         self._reset_pending = False
-        if self.temporal:
-            detail, colour, radius = self.detail
-            output = compose_detail(frame, resample(output, self.width, self.height),
-                                    detail_strength=detail, colour_strength=colour, radius=radius)
-        return output
+        return outputs
+
+    def _read_outputs(self, count):
+        width, height = ((self.width, self.height) if self.protocol_version == 4 else
+                         (self.processing_width, self.processing_height))
+        expected = height * width * 3 * self.output_dtype.itemsize
+        outputs = []
+        for _ in range(count):
+            data = bytearray(expected)
+            view, received = memoryview(data), 0
+            while received < expected:
+                size = self.process.stdout.readinto(view[received:])
+                if not size:
+                    raise RuntimeError(f"mlxdlss stream ended early (rebuild the binary if its protocol is outdated): {self._error_text()}")
+                received += size
+            outputs.append(np.frombuffer(data, dtype=self.output_dtype).reshape(height, width, 3))
+        return outputs
+
+    def finish(self) -> list[np.ndarray]:
+        if self._closed or self._finished:
+            return []
+        try:
+            try:
+                self.process.stdin.close()
+            except BrokenPipeError:
+                pass
+            outputs = self._read_outputs(self.pending_pairs * self.framegen_factor)
+            self.pending_pairs = 0
+            self._finished = True
+            return outputs
+        except BaseException:
+            self.abort()
+            raise
 
     def abort(self):
         if self._closed:
@@ -193,10 +258,7 @@ class MLXDLSSStreamSession:
         if self._closed:
             return self._summary
         try:
-            try:
-                self.process.stdin.close()
-            except BrokenPipeError:
-                pass
+            self.finish()
             self.process.wait(timeout=30)
             stderr = self._error_text()
             if self.process.returncode:
