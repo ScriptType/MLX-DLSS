@@ -9,7 +9,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from .effects import FrameGen, NeuralRender, OutputOptions
+from .effects import FrameGen, NeuralRender, OutputOptions, SuperResolution
 
 
 def available(settings, effects, source: Path) -> bool:
@@ -33,6 +33,14 @@ def rendering_arguments(nr: NeuralRender | None, settings, *, video: bool) -> li
         args += ["--temporal", "on" if nr.temporal else "off", "--motion", nr.motion,
                  "--scene-cut-threshold", str(nr.scene_cut_threshold)]
     return args
+
+
+def super_resolution_arguments(vsr: SuperResolution | None, settings) -> list[str]:
+    if vsr is None:
+        return []
+    if not settings.has_vsr_weights():
+        raise ValueError("Choose RTX VSR weights in Settings")
+    return ["--vsr-weights", str(Path(settings.vsr_weights).expanduser())]
 
 
 def video_arguments(source, target, effects, settings, output: OutputOptions) -> list[str]:

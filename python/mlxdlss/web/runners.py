@@ -14,7 +14,7 @@ from typing import Callable
 import numpy as np
 
 from ..video import find_tool, probe
-from .effects import FrameGen, NeuralRender, OutputOptions, parse_effects
+from .effects import FrameGen, NeuralRender, OutputOptions, SuperResolution, parse_effects, validate_chain
 from .jobs import Job
 from .settings import Settings
 
@@ -69,6 +69,7 @@ class JobRunner:
         settings = self.settings_provider()
         job.backend = "/".join(sorted({settings.resolved_backend(e.get("kind", "nr")) for e in job.effects}))
         effects = parse_effects(job.effects)
+        validate_chain(effects, job.kind)
         source = folder / ("input" + Path(job.input_name).suffix.lower())
         if job.kind == "image":
             return [self._image(source, folder, effects, settings, report, should_stop)]
@@ -78,8 +79,21 @@ class JobRunner:
     def _image(self, source: Path, folder: Path, effects, settings: Settings, report: Report, should_stop=lambda: False) -> Path:
         from PIL import Image, ImageOps
 
-        nr = next(e for e in effects if isinstance(e, NeuralRender))
+        nr = next((e for e in effects if isinstance(e, NeuralRender)), None)
+        vsr = next((e for e in effects if isinstance(e, SuperResolution)), None)
         out = folder / "result.png"
+        if vsr is not None:
+            from . import native
+            from ..mlxdlss_stream import find_mlxdlss
+
+            if not native.available(settings, effects, source):
+                raise ValueError("RTX VSR needs native Metal on macOS 26; select Auto or Metal in Settings")
+            arguments = native.rendering_arguments(nr, settings, video=False) + native.super_resolution_arguments(vsr, settings)
+            command = [find_mlxdlss(settings.mlxdlss_binary or None), "process-image", str(source), "--output", str(out)] + arguments
+            report("upscaling 2×" if nr is None else "neural rendering → upscale 2×", 0.2, 0, 1)
+            native.run_media(command, report, should_stop)
+            report("done", 1.0, 1, 1)
+            return out
         if settings.resolved_backend("nr") == "mlxdlss":
             # Metal: the whole frame stays on the GPU; the PyTorch graph below keeps the
             # activations of the entire frame in memory and needs tens of GB at 4K.

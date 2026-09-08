@@ -43,6 +43,8 @@ def settings_page() -> None:
             nr_model = path_setting("Metal package", ".dlssmodel from mlxdlss-weights mlx (macOS).", s.nr_model)
         with ds.card("Frame generation", tight=True):
             fg_weights = path_setting("Weights", "Dense safetensors from mlxdlss-weights extract-fg.", s.fg_weights)
+        with ds.card("RTX VSR · Experimental", tight=True):
+            vsr_weights = path_setting("Weights", "2× image upscaling on Metal. Safetensors from mlxdlss-weights extract-vsr.", s.vsr_weights)
         with ds.card("Execution", tight=True):
             with setting("Backend", "Auto picks Metal when the mlxdlss binary is available."):
                 backend = ui.toggle({"auto": "Auto", "torch": "PyTorch", "mlxdlss": "Metal"}, value=s.backend).props("unelevated no-caps dense toggle-color=primary").classes("mlxdlss-seg")
@@ -61,6 +63,7 @@ def settings_page() -> None:
         def save() -> None:
             try:
                 state.update_settings(nr_weights=nr_weights.value.strip(), nr_model=nr_model.value.strip(), fg_weights=fg_weights.value.strip(),
+                                      vsr_weights=vsr_weights.value.strip(),
                                       backend=backend.value, device=device.value, precision=precision.value, mlxdlss_binary=mlxdlss_binary.value.strip(),
                                       root=root.value.strip() or s.root, output_directory=output_directory.value.strip())
             except (ValueError, OSError) as error:

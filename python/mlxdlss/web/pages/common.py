@@ -69,6 +69,7 @@ def effect_editor(kind: str, initial: list[dict] | None = None, *, on_change=lam
     initial = initial or []
     nr0 = next((e for e in initial if e.get("kind") == "nr"), None)
     fg0 = next((e for e in initial if e.get("kind") == "fg"), None)
+    vsr0 = next((e for e in initial if e.get("kind") == "vsr"), None)
     with ds.card("Neural rendering") as box:
         with box.meta:
             nr_enabled = ui.switch(value=nr0 is not None or not initial).props('dense color=primary aria-label="Enable rendering"')
@@ -110,6 +111,12 @@ def effect_editor(kind: str, initial: list[dict] | None = None, *, on_change=lam
                 first = initial[0].get("kind") if initial else "nr"
                 order = ds.segmented_row("Order", {"nr_first": "Render → generate", "fg_first": "Generate → render"},
                                          value="fg_first" if first == "fg" else "nr_first")
+    vsr_enabled = None
+    if kind == "image":
+        with ds.card("Super resolution · Experimental"):
+            vsr_enabled = ds.switch_row("Upscale 2×", "RTX VSR increases image width and height by 2×.", value=vsr0 is not None).props('aria-label="Upscale 2×"')
+            if not settings.vsr_available():
+                ui.label("Requires macOS 26, Metal and RTX VSR weights in Settings.").classes("mlxdlss-warn mlxdlss-small")
 
     def chain() -> list[dict]:
         effects: list[dict] = []
@@ -127,10 +134,12 @@ def effect_editor(kind: str, initial: list[dict] | None = None, *, on_change=lam
                 effects.insert(0, fg)
             else:
                 effects.append(fg)
+        if vsr_enabled is not None and vsr_enabled.value:
+            effects.append({"kind": "vsr", "scale": 2})
         return effects
 
     for control in (nr_enabled, profile, scale, detail, colour, radius, intensity, temporal, motion, threshold,
-                    fg_enabled, fg_mode, fg_factor, fg_audio, order):
+                    fg_enabled, fg_mode, fg_factor, fg_audio, order, vsr_enabled):
         if control is not None:
             control.on_value_change(lambda _: on_change())
     return chain

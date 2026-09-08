@@ -105,6 +105,9 @@ frame while adjusting controls. Export batches with NR/FG in either order,
 FG ×2–16, slow motion, H.264/HEVC/ProRes, audio and frame ranges. Jobs support
 cancel, retry and downloads; the output folder is configurable.
 
+On macOS 26+, images also support **Upscale 2×** with RTX VSR weights in Settings.
+Preview and export use the same Metal model.
+
 Temporal is on for new videos. Preview uses up to three preceding frames;
 frame generation runs on export. Saved jobs retain their settings.
 

@@ -18,6 +18,7 @@ class Settings:
     nr_weights: str = ""          # logical safetensors (mlxdlss-weights decode) for the torch backend
     nr_model: str = ""            # MODEL.dlssmodel for the Swift/Metal backend
     fg_weights: str = ""          # dense frame generation safetensors (mlxdlss-weights extract-fg)
+    vsr_weights: str = ""         # RTX VSR safetensors (mlxdlss-weights extract-vsr)
     backend: str = "auto"         # auto | torch | mlxdlss
     device: str = "auto"          # torch device
     precision: str = "reference"  # torch precision for neural rendering (reference | fast ...)
@@ -64,6 +65,15 @@ class Settings:
     def has_fg_weights(self) -> bool:
         return bool(self.fg_weights) and Path(self.fg_weights).expanduser().exists()
 
+    def has_vsr_weights(self) -> bool:
+        return bool(self.vsr_weights) and Path(self.vsr_weights).expanduser().is_file()
+
+    def vsr_available(self) -> bool:
+        from . import native
+        from .effects import SuperResolution
+
+        return self.has_vsr_weights() and self.mlxdlss_available() and native.available(self, [SuperResolution()], Path("image.png"))
+
     # -- persistence -----------------------------------------------------------
     @property
     def path(self) -> Path:
@@ -82,7 +92,7 @@ class Settings:
                     setattr(settings, f.name, data[f.name])
         except (OSError, ValueError):
             pass
-        for key, attribute in (("MLXDLSS_NR_WEIGHTS", "nr_weights"), ("MLXDLSS_NR_MODEL", "nr_model"), ("MLXDLSS_FG_WEIGHTS", "fg_weights"), ("MLXDLSS_BINARY", "mlxdlss_binary")):
+        for key, attribute in (("MLXDLSS_NR_WEIGHTS", "nr_weights"), ("MLXDLSS_NR_MODEL", "nr_model"), ("MLXDLSS_FG_WEIGHTS", "fg_weights"), ("MLXDLSS_VSR_WEIGHTS", "vsr_weights"), ("MLXDLSS_BINARY", "mlxdlss_binary")):
             if os.environ.get(key) and not getattr(settings, attribute):
                 setattr(settings, attribute, os.environ[key])
         return settings

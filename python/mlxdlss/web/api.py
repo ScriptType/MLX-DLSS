@@ -24,7 +24,8 @@ def build_router(state: WebState) -> APIRouter:
     @router.get("/effects")
     def effects() -> dict:
         s = state.settings
-        return describe_effects(mlxdlss_available=s.mlxdlss_available(), fg_weights=s.has_fg_weights(), nr_weights=s.has_nr_weights())
+        return describe_effects(mlxdlss_available=s.mlxdlss_available(), fg_weights=s.has_fg_weights(),
+                                nr_weights=s.has_nr_weights(), vsr_available=s.vsr_available())
 
     @router.get("/jobs")
     def jobs() -> list[dict]:

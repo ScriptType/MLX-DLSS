@@ -216,7 +216,7 @@ class ApiAndRunnerTests(unittest.TestCase):
 
     def test_effects_endpoint(self):
         data = self.client.get("/api/effects").json()
-        self.assertEqual({e["kind"] for e in data["effects"]}, {"nr", "fg"})
+        self.assertEqual({e["kind"] for e in data["effects"]}, {"nr", "fg", "vsr"})
         self.assertTrue(data["backends"]["torch"])
 
     def test_image_job_runs_neural_rendering(self):

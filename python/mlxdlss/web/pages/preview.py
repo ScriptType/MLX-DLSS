@@ -95,7 +95,7 @@ class LivePreview:
             self.position.set_text(f'{result["time"]:.3f} / {result["duration"]:.2f} s')
         self.updating = False
         temporal = f' · Temporal · {result["historyFrames"]} preceding frames' if result["historyFrames"] else ""
-        self.status.set_text(f'{result["width"]} × {result["height"]}{temporal} · {result["elapsedSeconds"]:.2f} s')
+        self.status.set_text(f'Output: {result["width"]} × {result["height"]}{temporal} · {result["elapsedSeconds"]:.2f} s')
         self.display()
 
     def display(self):

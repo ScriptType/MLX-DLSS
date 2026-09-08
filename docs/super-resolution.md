@@ -1,6 +1,6 @@
 # Super resolution
 
-**RTX VSR 2× works in the native app, CLI and Swift API. DLSS Super Resolution
+**RTX VSR 2× works in the native app, web images, CLI and Swift API. DLSS Super Resolution
 is still being recovered.** Each port is checked against its own NVIDIA library
 with matching inputs and state.
 
@@ -31,6 +31,10 @@ In the app, choose the weights under **Super Resolution** and enable **Upscale
 timestamps, audio and frame-generation cadence are preserved. Swift callers
 set `MediaProcessingOptions.superResolutionWeights`, or use
 `VideoSuperResolver.upscale` for `[N,H,W,3]` tensors.
+
+In the web app on macOS 26+, add RTX VSR weights in **Settings**, select Auto
+or Metal, then enable **Upscale 2×** on the Image page. It works alone or after
+neural rendering, including live previews and batch export.
 
 ### Reference checks
 

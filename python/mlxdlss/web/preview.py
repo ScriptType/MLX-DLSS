@@ -16,7 +16,7 @@ import numpy as np
 from PIL import Image
 
 from . import native
-from .effects import NeuralRender, parse_effects, validate_chain
+from .effects import NeuralRender, SuperResolution, parse_effects, validate_chain
 
 
 class LatestPreview:
@@ -79,19 +79,23 @@ class PreviewSession:
         if effects:
             validate_chain(effects, kind)
         nr = next((e for e in effects if isinstance(e, NeuralRender)), None)
+        vsr = next((e for e in effects if isinstance(e, SuperResolution)), None)
         with self.runner.cache.execution_lock:
             if self.closed.is_set():
                 raise RuntimeError("Preview closed")
             settings = self.runner.settings_provider()
-            if native.available(settings, [nr] if nr else [], source):
-                return self._native(source, kind, nr, settings, seconds)
+            if native.available(settings, [e for e in (nr, vsr) if e is not None], source):
+                return self._native(source, kind, nr, vsr, settings, seconds)
             self._stop_process()
+            if vsr is not None:
+                raise ValueError("RTX VSR needs native Metal on macOS 26; select Auto or Metal in Settings")
             return self._portable(source, kind, nr, settings, seconds)
 
-    def _native(self, source, kind, nr, settings, seconds):
+    def _native(self, source, kind, nr, vsr, settings, seconds):
         from ..mlxdlss_stream import find_mlxdlss
 
         binary = find_mlxdlss(settings.mlxdlss_binary or None)
+        options = native.rendering_arguments(nr, settings, video=kind == "video") + native.super_resolution_arguments(vsr, settings)
         if self.process is None or self.process.poll() is not None or self.process_key != binary:
             self._stop_process()
             self.errors = tempfile.TemporaryFile()
@@ -103,7 +107,7 @@ class PreviewSession:
             self._stop_process()
             raise RuntimeError("Preview closed")
         request = {"input": str(source), "video": kind == "video", "time": seconds,
-                   "options": native.rendering_arguments(nr, settings, video=kind == "video")}
+                   "options": options}
         try:
             process.stdin.write(json.dumps(request) + "\n")
             process.stdin.flush()

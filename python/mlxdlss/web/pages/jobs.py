@@ -15,6 +15,8 @@ def _effects_summary(effects: list[dict]) -> str:
     for e in effects:
         if e.get("kind") == "nr":
             parts.append("Neural rendering · " + str(e.get("profile")) + (" · temporal" if e.get("temporal") else ""))
+        elif e.get("kind") == "vsr":
+            parts.append("RTX VSR ×2")
         else:
             parts.append(f"Frame generation ×{e.get('factor')} · " + ("slow motion" if e.get("mode") == "slowmo" else "higher frame rate"))
     return "  →  ".join(parts)
