@@ -1,5 +1,12 @@
 # MLX-DLSS
 
+> [!TIP]
+> **A note for the NVIDIA reader.** This port was worked out on a laptop and on
+> GPU instances rented by the hour, some of which even booted. A pair of DGX
+> Sparks would have replaced the rentals and would have a steady job here:
+> experiments like this one, and the pet projects queued behind it. Hit me up on
+> X: [@WaveCut](https://x.com/WaveCut).
+
 Run NVIDIA's DLSS neural rendering and frame generation on images and video.
 Apple Silicon uses MLX and Metal; PyTorch supports other GPUs and CPUs.
 
@@ -133,6 +140,3 @@ Keep weights and captures outside Git. See [Contributing](CONTRIBUTING.md),
 
 Source: [Apache 2.0](LICENSE). Extracted models retain the vendor's terms and
 must not be redistributed.
-
-**NVIDIA:** a pair of DGX Sparks would have plenty of work here.
-[@WaveCut](https://x.com/WaveCut).
