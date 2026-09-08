@@ -1,36 +1,71 @@
-# Super resolution: measured, not ported
+# Super resolution
 
-DLSS Super Resolution (`nvngx_dlss.dll`, run through the vendor's library on
-an RTX 5090) was evaluated on realistic content to decide whether a port is
-worth the work. It is not, for the reasons below.
+**RTX VSR 2× works in the native app, CLI and Swift API. DLSS Super Resolution
+is still being recovered.** Each port is checked against its own NVIDIA library
+with matching inputs and state.
 
-## What the network needs
+NVIDIA's [browser setting](https://www.nvidia.com/content/Control-Panel-Help/vLatest/en-us/mergedProjects/Display/Reference_Adjust_Video_Image_Settings.htm)
+upscales video playback. The VFX SDK also accepts individual image frames,
+which makes its VSR model usable for stills.
 
-The model expects engine-produced motion vectors and a per-frame jitter
-sequence that matches them. Finished video and photographs have neither, and
-the conditions cannot be reproduced convincingly from the outside.
+## RTX Video Super Resolution
 
-## Measurements
+The experimental port supports VSR **1.8.2, High Bitrate Low (mode 16), 2×**.
+It runs on Swift/MLX/Metal without Python at runtime. The mode processes each
+image independently and uses RGB8 input/output quantization.
 
-Protocol: downsample the original, upscale with the library, compare with the
-original crop (PSNR); Lanczos resampling as the baseline.
+Prepare weights from your own `libnvidia-ngx-vsr.so.1.8.2`, supplied with
+[NVIDIA VFX](https://docs.nvidia.com/maxine/vfx/latest/Filters/VideoSuperResolution.html):
 
-| test | result |
+```sh
+mlxdlss-weights extract-vsr libnvidia-ngx-vsr.so.1.8.2 weights/vsr.safetensors
+.build/release/mlxdlss process-image in.png --output out.png --vsr-weights weights/vsr.safetensors
+.build/release/mlxdlss process-video in.mp4 --output out.mp4 --vsr-weights weights/vsr.safetensors
+```
+
+The converter checks the exact source SHA-256 and preserves existing output.
+Other library builds, quality modes and scale factors are unsupported.
+
+In the app, choose the weights under **Super Resolution** and enable **Upscale
+2×**. Live preview uses the same model. VSR can run alone or after NR and FG;
+timestamps, audio and frame-generation cadence are preserved. Swift callers
+set `MediaProcessingOptions.superResolutionWeights`, or use
+`VideoSuperResolver.upscale` for `[N,H,W,3]` tensors.
+
+### Reference checks
+
+Reference: NVIDIA's Linux VSR 1.8.2 library on RTX 4090, driver 580.173.02.
+Metal: M2 Max, FP16. This does not establish Windows DLL parity.
+
+| Inputs | Maximum channel difference |
 | --- | --- |
-| 30 photographic single frames, 2× and 3× | loses to Lanczos in all 30, by 4.84 dB on average |
-| 16-frame history with a TAA-style jitter sequence | 2.5–3 dB worse than single frames; accumulation exhausted by the third frame |
-| real video, optical flow standing in for engine motion | trails Lanczos by 1.85 dB at the first frame and 4.87 dB by the twenty-fourth |
-| control: deliberately wrong motion vectors | 42.7 % of output pixels change, so the vectors reach the network; the verdict is about the model, not the plumbing |
+| Synthetic frame, 640×360 still, eight 512×384 video frames | 1/255 |
+| 97×65 noise, gradients and one-pixel lines | 1/255 |
+| 97×65 black/white checkerboard | 2/255 in 6 of 75,660 values |
+| 1920×1080 still → 3840×2160 | 2/255 in 5 of 24,883,200 values |
 
-| scale, motion | Lanczos | DLSS SR | DLSS SR + jitter |
-| --- | --- | --- | --- |
-| 2×, zero motion | 40.29 | 34.29 | 34.59 |
-| 2×, jittered | 40.29 | 31.80 | 31.87 |
-| 3×, zero motion | 33.31 | 30.37 | 30.69 |
-| 3×, jittered | 33.31 | 28.92 | 28.80 |
+All 66 extracted tensors match the GPU-captured parameters byte for byte.
+Model tests cover quantization, output activation, pixel shuffle, borders and
+batching. Private reference captures are loaded through
+`MLXDLSS_VSR_REFERENCE`; vendor data is excluded from Git.
 
-## Consequence
+The NVIDIA Python binding reports incorrect DLPack row strides for some odd
+widths. The reference runner uses edge padding and crops the output; this was
+checked against the original unpadded CUDA output surface.
 
-For enlarging realistic content an ordinary resampler is the better tool; the
-detail pass of the neural-rendering network is what adds anything. Super
-resolution is out of scope for this package.
+## DLSS Super Resolution
+
+The original Linux DLSS SDK 310.7.0 library now runs on RTX with corrected LDR
+and low-resolution-motion flags. Captures include individual network stages,
+static history and moving video. Reconstructing the Metal graph and temporal
+state remains open; DLSS SR is not exposed in the app.
+
+The old Lanczos comparison did not establish port fidelity. Its harness also
+used HDR flags for normalized sRGB and omitted the low-resolution-motion flag,
+so it cannot justify the previous blanket rejection of DLSS SR.
+
+The next gate is matching the original preprocessing, transformer stages and
+history update on identical inputs. Quality on finished media is a separate
+check after that. See NVIDIA's
+[DLSS integration guide](https://github.com/NVIDIA-RTX/Streamline/blob/main/docs/ProgrammingGuideDLSS.md)
+for motion, depth and jitter conventions.

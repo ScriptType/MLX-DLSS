@@ -12,8 +12,8 @@ public actor NativeMediaProcessor {
   public func processImage(input: URL, output: URL, options: MediaProcessingOptions) async throws -> MediaProcessingResult {
     try options.validate()
     guard !busy else { throw MLXMediaError("This processor is already running a job") }
-    guard options.renderingModel != nil, options.frameGenerationWeights == nil else {
-      throw MLXMediaError("Images require neural rendering without frame generation")
+    guard options.frameGenerationWeights == nil else {
+      throw MLXMediaError("Frame generation requires video")
     }
     busy = true
     defer { busy = false }
@@ -22,8 +22,15 @@ public actor NativeMediaProcessor {
     let source = try await io.read(input)
     let renderer = try makeRenderer(width: source.width, height: source.height, options: options)
     try Task.checkCancellation()
-    let rendered = try await renderer!.renderVideoFrame(source, motion: nil,
-      context: .init(streamID: 1, frameIndex: 0), processingScale: options.processingScale, temporal: false)
+    var rendered = source
+    if let renderer {
+      rendered = try await renderer.renderVideoFrame(source, motion: nil,
+        context: .init(streamID: 1, frameIndex: 0), processingScale: options.processingScale, temporal: false)
+    }
+    if let weights = options.superResolutionWeights {
+      let upscaler = try MLXNativeSuperResolver(weightsURL: weights)
+      rendered = try await upscaler.upscale(rendered)
+    }
     try Task.checkCancellation()
     try await io.write(rendered, to: output)
     return MediaProcessingResult(output: output, inputFrames: 1, outputFrames: 1, sceneResets: 0,
@@ -53,6 +60,7 @@ public actor NativeMediaProcessor {
     let renderer = try makeRenderer(width: width, height: height, options: options)
     let generator = try options.frameGenerationWeights.map { try MLXNativeFrameGenerator(weightsURL: $0,
       precision: options.precision == .float16 ? .float16 : .float32) }
+    let upscaler = try options.superResolutionWeights.map { try MLXNativeSuperResolver(weightsURL: $0) }
     let flow = options.temporal && renderer != nil
       ? try NativeOpticalFlow(width: width, height: height, mode: options.motion) : nil
     let factor = generator == nil ? 1 : options.frameGenerationFactor
@@ -67,7 +75,8 @@ public actor NativeMediaProcessor {
       attributes: [.posixPermissions: 0o700])
     defer { try? FileManager.default.removeItem(at: staging) }
     let temporary = staging.appendingPathComponent(output.lastPathComponent)
-    let writer = try NativeVideoWriter(url: temporary, width: width, height: height,
+    let scale = upscaler == nil ? 1 : 2
+    let writer = try NativeVideoWriter(url: temporary, width: width * scale, height: height * scale,
       frameRate: Double(reader.nominalFrameRate) * Double(factor) / Double(timeScale), options: options, hasAudio: audio != nil)
     // Each receiver can suspend until the other track advances. Feeding audio
     // and video from the same task can deadlock the muxer's interleave queues.
@@ -109,6 +118,12 @@ public actor NativeMediaProcessor {
 
     func emit(_ frame: MLXVideoFrame, sourceTime: CMTime, isolation: isolated (any Actor)? = #isolation) async throws {
       try Task.checkCancellation()
+      var frame = frame
+      if let upscaler {
+        let upscalingStarted = ContinuousClock.now
+        frame = try await upscaler.upscale(frame)
+        timing.superResolutionSeconds = (timing.superResolutionSeconds ?? 0) + seconds(since: upscalingStarted)
+      }
       let time = CMTimeMultiply(sourceTime - first.time, multiplier: Int32(timeScale))
       let encodingStarted = ContinuousClock.now
       try await writer.append(frame, at: time)

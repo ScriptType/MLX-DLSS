@@ -47,6 +47,9 @@ Temporal rendering is on by default. Live preview uses up to three preceding
 frames; export uses the full sequence and applies frame generation. Native
 video output is SDR 8-bit; PNG/TIFF stills retain 16-bit output.
 
+Experimental [RTX VSR 2×](docs/super-resolution.md) also supports images, video
+and live preview, with separately prepared weights.
+
 ![Native macOS app with temporal preview and frame generation](docs/assets/native-app.png)
 
 ## Weights
@@ -135,7 +138,7 @@ See [measurements and experiments](docs/embedding.md#performance),
 
 - [Swift API and native media](docs/embedding.md)
 - [Frame generation](docs/frame-generation.md)
-- [Super resolution: measured, not ported](docs/super-resolution.md)
+- [Super resolution: RTX VSR and DLSS SR](docs/super-resolution.md)
 - [Model recovery](docs/recovery-notes.md) and [research](docs/research/)
 
 ```sh

@@ -13,4 +13,11 @@ final class MediaOptionsTests: XCTestCase {
     XCTAssertThrowsError(try options.validate())
     XCTAssertThrowsError(try MediaProcessingOptions().validate())
   }
+
+  func testSuperResolutionCanRunAloneButDoesNotEnableSlowMotion() throws {
+    var options = MediaProcessingOptions(superResolutionWeights: URL(fileURLWithPath: "/vsr.safetensors"))
+    try options.validate()
+    options.slowMotion = true
+    XCTAssertThrowsError(try options.validate())
+  }
 }

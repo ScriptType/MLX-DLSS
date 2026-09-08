@@ -127,6 +127,8 @@ def build_parser() -> argparse.ArgumentParser:
     digest.add_argument("path", type=pathlib.Path)
     framegen = commands.add_parser("extract-fg", help="libnvidia-ngx-dlssg.so -> dense frame generation safetensors for mlxdlss-video / FrameGenerator")
     framegen.add_argument("library", type=pathlib.Path); framegen.add_argument("destination", type=pathlib.Path)
+    vsr = commands.add_parser("extract-vsr", help="VSR 1.8.2 library -> High Bitrate Low 2x weights for native Metal")
+    vsr.add_argument("library", type=pathlib.Path); vsr.add_argument("destination", type=pathlib.Path)
     return parser
 
 
@@ -145,6 +147,10 @@ def main(argv: list[str] | None = None) -> int:
         from .extract_dlssg_weights import main as extract_fg
 
         return extract_fg([str(args.library), str(args.destination)])
+    if args.command == "extract-vsr":
+        from .extract_vsr_weights import main as extract_vsr
+
+        return extract_vsr([str(args.library), str(args.destination)])
     if args.command == "extract":
         return _extract(args.dll, args.destination, args.resource_blob)
     if args.command == "decode":

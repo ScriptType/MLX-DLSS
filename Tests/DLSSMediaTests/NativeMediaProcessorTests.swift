@@ -18,7 +18,8 @@ final class NativeMediaProcessorTests: XCTestCase, @unchecked Sendable {
     let input = try await makeVideo(in: directory)
     let processor = NativeMediaProcessor()
     var options = MediaProcessingOptions(renderingModel: URL(fileURLWithPath: model),
-      frameGenerationWeights: URL(fileURLWithPath: generation))
+      frameGenerationWeights: URL(fileURLWithPath: generation),
+      superResolutionWeights: environment["MLXDLSS_VSR_WEIGHTS"].map { URL(fileURLWithPath: $0) })
     options.startFrame = 2
     options.frameLimit = 4
     options.motion = .zero
@@ -40,7 +41,11 @@ final class NativeMediaProcessorTests: XCTestCase, @unchecked Sendable {
       XCTAssertEqual(duration, 7 / rate, accuracy: 0.002)
       let reader = try await NativeVideoReader(url: output, options: MediaProcessingOptions())
       var times: [Double] = []
-      while let frame = try await reader.next() { times.append(frame.time.seconds) }
+      while let frame = try await reader.next() {
+        XCTAssertEqual(frame.rgb.width, options.superResolutionWeights == nil ? 96 : 192)
+        XCTAssertEqual(frame.rgb.height, options.superResolutionWeights == nil ? 64 : 128)
+        times.append(frame.time.seconds)
+      }
       XCTAssertEqual(times.count, 7)
       for (index, time) in times.enumerated() { XCTAssertEqual(time, Double(index) / rate, accuracy: 1e-5) }
     }

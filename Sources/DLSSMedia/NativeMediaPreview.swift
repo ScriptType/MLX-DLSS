@@ -41,6 +41,8 @@ public actor NativeMediaPreview {
   private var renderer: MLXNeuralRenderingDeviceTemporalBackend?
   private var modelURL: URL?
   private var precision: MLXComputePrecision?
+  private var upscaler: MLXNativeSuperResolver?
+  private var superResolutionURL: URL?
   private var motionKey: MotionKey?
   private var motions: [MLXVideoMotion?] = []
   private var busy = false
@@ -60,7 +62,9 @@ public actor NativeMediaPreview {
   public func render(_ request: MediaPreviewRequest) async throws -> MediaPreviewResult {
     guard !busy else { throw MLXMediaError("Submit preview requests sequentially") }
     guard request.time.isFinite, request.time >= 0 else { throw MLXMediaError("Invalid preview time") }
-    if request.options.renderingModel != nil { try request.options.validate() }
+    if request.options.renderingModel != nil || request.options.superResolutionWeights != nil {
+      try request.options.validate()
+    }
     busy = true
     defer { busy = false }
     let started = ContinuousClock.now
@@ -76,7 +80,7 @@ public actor NativeMediaPreview {
     if original == nil { original = try await io.displayImage(selected.rgb) }
     try Task.checkCancellation()
     let options = request.options
-    var processed = original!
+    var result = selected.rgb
     var historyFrames = 0
     if let url = options.renderingModel {
       if renderer == nil || modelURL != url || precision != options.precision {
@@ -105,7 +109,6 @@ public actor NativeMediaPreview {
       let outputOptions = try MLXVideoOutputOptions(width: selected.rgb.width, height: selected.rgb.height,
         detailStrength: options.detailStrength, colourStrength: options.colourStrength, radius: options.detailRadius)
       let indices = temporal ? Array(frames.indices) : [frames.count - 1]
-      var result = selected.rgb
       for (ordinal, index) in indices.enumerated() {
         try Task.checkCancellation()
         result = try await renderer.renderVideoFrame(frames[index].rgb, motion: temporal ? motions[index] : nil,
@@ -114,9 +117,22 @@ public actor NativeMediaPreview {
           intensity: options.intensity)
       }
       try Task.checkCancellation()
-      processed = try await io.displayImage(result)
       historyFrames = indices.count - 1
     }
+    if let url = options.superResolutionWeights {
+      if upscaler == nil || superResolutionURL != url {
+        upscaler = nil
+        upscaler = try MLXNativeSuperResolver(weightsURL: url)
+        superResolutionURL = url
+      }
+      result = try await upscaler!.upscale(result)
+    } else {
+      upscaler = nil
+      superResolutionURL = nil
+    }
+    try Task.checkCancellation()
+    let processed = options.renderingModel != nil || options.superResolutionWeights != nil
+      ? try await io.displayImage(result) : original!
     let elapsed = started.duration(to: .now).components
     return MediaPreviewResult(original: original!, processed: processed, time: selected.time.seconds,
       duration: duration, frameInterval: frameInterval, historyFrames: historyFrames,

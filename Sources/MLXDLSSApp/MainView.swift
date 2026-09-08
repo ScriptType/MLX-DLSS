@@ -157,7 +157,7 @@ private struct LiveFramePreview: View {
             }.disabled(model.isRunning)
           }
           HStack {
-            Text("\(preview.processed.width) × \(preview.processed.height)")
+            Text("\(showOriginal ? preview.original.width : preview.processed.width) × \(showOriginal ? preview.original.height : preview.processed.height)")
             if video {
               Text("·")
               Text(preview.historyFrames > 0 ? "Temporal preview · \(preview.historyFrames) preceding frames" : "Single-frame preview")
@@ -241,6 +241,14 @@ private struct ProcessingControls: View {
           Text("Generate → Render").tag(MediaEffectOrder.generationThenRendering)
         }.disabled(!model.generationEnabled || !model.renderingEnabled)
       }.disabled(model.selectedJob?.isVideo == false)
+      Section("Super Resolution · Experimental") {
+        Toggle("Upscale 2×", isOn: $model.superResolutionEnabled)
+        Button(model.superResolutionPath.isEmpty ? "Choose VSR Weights…" : URL(fileURLWithPath: model.superResolutionPath).lastPathComponent) {
+          model.chooseSuperResolutionWeights()
+        }.help(model.superResolutionPath).lineLimit(1)
+        Text("RTX VSR · High Bitrate Low. Applied after rendering and frame generation.")
+          .font(.caption).foregroundStyle(.secondary)
+      }
       Section("Output") {
         Picker("Video codec", selection: $model.codec) {
           Text("H.264").tag(MediaVideoCodec.h264)

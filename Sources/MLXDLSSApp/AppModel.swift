@@ -34,8 +34,10 @@ final class AppModel {
   var alert: String?
   var renderingEnabled = true
   var generationEnabled = false
+  var superResolutionEnabled = false
   var modelPath: String
   var generationPath: String
+  var superResolutionPath: String
   var outputDirectory: String
   var profile: NeuralRenderingControlProfile = .standard
   var temporal = true
@@ -68,6 +70,7 @@ final class AppModel {
     let defaults = UserDefaults.standard
     modelPath = defaults.string(forKey: "renderingModel") ?? Self.locateWeight("NeuralRendering.dlssmodel")
     generationPath = defaults.string(forKey: "generationWeights") ?? Self.locateWeight("framegen.safetensors")
+    superResolutionPath = defaults.string(forKey: "superResolutionWeights") ?? Self.locateWeight("vsr.safetensors")
     outputDirectory = defaults.string(forKey: "outputDirectory") ?? FileManager.default.homeDirectoryForCurrentUser
       .appendingPathComponent("MLX-DLSS/outputs").path
   }
@@ -103,6 +106,9 @@ final class AppModel {
         do {
           if renderingEnabled && next.request.options.renderingModel == nil {
             throw MLXMediaError("Choose a neural-rendering model to enable live rendering")
+          }
+          if superResolutionEnabled && next.request.options.superResolutionWeights == nil {
+            throw MLXMediaError("Choose VSR weights to enable live upscaling")
           }
           if previewSession == nil { previewSession = try NativeMediaPreview() }
           let result = try await previewSession!.render(next.request)
@@ -154,14 +160,24 @@ final class AppModel {
     if panel.runModal() == .OK, let url = panel.url { outputDirectory = url.path; savePaths() }
   }
 
+  func chooseSuperResolutionWeights() {
+    let panel = NSOpenPanel()
+    panel.canChooseDirectories = false
+    panel.message = "Choose VSR 2× .safetensors weights"
+    if panel.runModal() == .OK, let url = panel.url {
+      superResolutionPath = url.path
+      savePaths()
+    }
+  }
+
   func runQueue() {
     guard !isRunning, hasQueuedJobs else { return }
     let queued = jobs.filter { $0.state == .queued }
     let options: MediaProcessingOptions
     do {
       options = try processingOptions()
-      if queued.contains(where: { !$0.isVideo }), options.renderingModel == nil {
-        throw MLXMediaError("Enable neural rendering to process images")
+      if queued.contains(where: { !$0.isVideo }), options.renderingModel == nil, options.superResolutionWeights == nil {
+        throw MLXMediaError("Enable neural rendering or super resolution to process images")
       }
     } catch { alert = error.localizedDescription; return }
     savePaths()
@@ -214,6 +230,7 @@ final class AppModel {
     let options = options(forPreview: false)
     if renderingEnabled && options.renderingModel == nil { throw MLXMediaError("Choose a neural-rendering model") }
     if generationEnabled && options.frameGenerationWeights == nil { throw MLXMediaError("Choose frame-generation weights") }
+    if superResolutionEnabled && options.superResolutionWeights == nil { throw MLXMediaError("Choose VSR weights") }
     try options.validate()
     return options
   }
@@ -221,7 +238,8 @@ final class AppModel {
   private func options(forPreview: Bool) -> MediaProcessingOptions {
     var options = MediaProcessingOptions(
       renderingModel: renderingEnabled && !modelPath.isEmpty ? URL(fileURLWithPath: modelPath) : nil,
-      frameGenerationWeights: !forPreview && generationEnabled && !generationPath.isEmpty ? URL(fileURLWithPath: generationPath) : nil)
+      frameGenerationWeights: !forPreview && generationEnabled && !generationPath.isEmpty ? URL(fileURLWithPath: generationPath) : nil,
+      superResolutionWeights: superResolutionEnabled && !superResolutionPath.isEmpty ? URL(fileURLWithPath: superResolutionPath) : nil)
     options.profile = profile
     options.temporal = temporal
     options.motion = motion
@@ -246,6 +264,7 @@ final class AppModel {
   private func savePaths() {
     UserDefaults.standard.set(modelPath, forKey: "renderingModel")
     UserDefaults.standard.set(generationPath, forKey: "generationWeights")
+    UserDefaults.standard.set(superResolutionPath, forKey: "superResolutionWeights")
     UserDefaults.standard.set(outputDirectory, forKey: "outputDirectory")
   }
 

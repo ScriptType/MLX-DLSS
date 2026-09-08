@@ -18,6 +18,7 @@ public enum MediaMotion: String, Codable, CaseIterable, Sendable {
 public struct MediaProcessingOptions: Equatable, Sendable {
   public var renderingModel: URL?
   public var frameGenerationWeights: URL?
+  public var superResolutionWeights: URL?
   public var order: MediaEffectOrder = .renderingThenGeneration
   public var temporal = true
   public var motion: MediaMotion = .automatic
@@ -37,14 +38,15 @@ public struct MediaProcessingOptions: Equatable, Sendable {
   public var frameLimit: Int?
   public var precision: MLXComputePrecision = .float16
 
-  public init(renderingModel: URL? = nil, frameGenerationWeights: URL? = nil) {
+  public init(renderingModel: URL? = nil, frameGenerationWeights: URL? = nil, superResolutionWeights: URL? = nil) {
     self.renderingModel = renderingModel
     self.frameGenerationWeights = frameGenerationWeights
+    self.superResolutionWeights = superResolutionWeights
   }
 
   public func validate() throws {
-    guard renderingModel != nil || frameGenerationWeights != nil else {
-      throw MLXMediaError("Select a neural-rendering model or frame-generation weights")
+    guard renderingModel != nil || frameGenerationWeights != nil || superResolutionWeights != nil else {
+      throw MLXMediaError("Select neural rendering, frame generation or super resolution weights")
     }
     guard processingScale.isFinite, (1...4).contains(processingScale),
       detailStrength.isFinite, (0...8).contains(detailStrength),
@@ -92,6 +94,7 @@ public struct MediaStageTiming: Codable, Sendable {
   public var motionSeconds: Double = 0
   public var renderingSeconds: Double = 0
   public var generationSeconds: Double = 0
+  public var superResolutionSeconds: Double? = nil
   public var encodingSeconds: Double = 0
   public var audioSeconds: Double = 0
 }
