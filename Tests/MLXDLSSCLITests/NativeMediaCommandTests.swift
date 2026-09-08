@@ -3,6 +3,16 @@ import XCTest
 @testable import mlxdlss
 
 final class NativeMediaCommandTests: XCTestCase {
+  func testDLSSSuperResolutionIsVideoOnlyAndExclusive() throws {
+    let base = ["input.mp4", "--sr-model", "model.srmodel", "--output", "result.mp4"]
+    let parsed = try ProcessMediaCommand.parse(arguments: base, video: true)
+    XCTAssertEqual(parsed.options.dlssSuperResolutionModel?.lastPathComponent, "model.srmodel")
+    XCTAssertTrue(parsed.options.temporal)
+    XCTAssertNil(parsed.options.superResolutionWeights)
+    XCTAssertThrowsError(try ProcessMediaCommand.parse(arguments: base, video: false))
+    XCTAssertThrowsError(try ProcessMediaCommand.parse(arguments: base + ["--vsr-weights", "vsr.safetensors"], video: true))
+  }
+
   func testNativeVideoDefaultsAndStrictOptions() throws {
     let base = ["input.mp4", "--model", "model.dlssmodel", "--output", "result.mp4"]
     let parsed = try ProcessMediaCommand.parse(arguments: base, video: true)

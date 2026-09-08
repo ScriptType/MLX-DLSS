@@ -43,6 +43,8 @@ public actor NativeMediaPreview {
   private var precision: MLXComputePrecision?
   private var upscaler: MLXNativeSuperResolver?
   private var superResolutionURL: URL?
+  private var dlss: MLXNativeDLSSSuperResolver?
+  private var dlssURL: URL?
   private var motionKey: MotionKey?
   private var motions: [MLXVideoMotion?] = []
   private var busy = false
@@ -62,8 +64,11 @@ public actor NativeMediaPreview {
   public func render(_ request: MediaPreviewRequest) async throws -> MediaPreviewResult {
     guard !busy else { throw MLXMediaError("Submit preview requests sequentially") }
     guard request.time.isFinite, request.time >= 0 else { throw MLXMediaError("Invalid preview time") }
-    if request.options.renderingModel != nil || request.options.superResolutionWeights != nil {
+    if request.options.renderingModel != nil || request.options.superResolutionWeights != nil || request.options.dlssSuperResolutionModel != nil {
       try request.options.validate()
+    }
+    guard request.isVideo || request.options.dlssSuperResolutionModel == nil else {
+      throw MLXMediaError("Use RTX VSR for images; DLSS SR requires video")
     }
     busy = true
     defer { busy = false }
@@ -82,6 +87,14 @@ public actor NativeMediaPreview {
     let options = request.options
     var result = selected.rgb
     var historyFrames = 0
+    if let url = options.dlssSuperResolutionModel {
+      if dlss == nil || dlssURL != url {
+        dlss = nil
+        dlss = try MLXNativeDLSSSuperResolver(packageURL: url)
+        dlssURL = url
+      }
+      await dlss!.reset()
+    } else { dlss = nil; dlssURL = nil }
     if let url = options.renderingModel {
       if renderer == nil || modelURL != url || precision != options.precision {
         renderer = nil
@@ -90,7 +103,9 @@ public actor NativeMediaPreview {
         modelURL = url
         precision = options.precision
       }
-      let renderer = renderer!
+      await renderer!.reset(sequenceID: 1)
+    }
+    if options.renderingModel != nil || dlss != nil {
       let temporal = request.isVideo && options.temporal
       if temporal {
         let key = MotionKey(mode: options.motion, threshold: options.sceneCutThreshold)
@@ -105,16 +120,21 @@ public actor NativeMediaPreview {
           motionKey = key
         }
       }
-      await renderer.reset(sequenceID: 1)
       let outputOptions = try MLXVideoOutputOptions(width: selected.rgb.width, height: selected.rgb.height,
         detailStrength: options.detailStrength, colourStrength: options.colourStrength, radius: options.detailRadius)
       let indices = temporal ? Array(frames.indices) : [frames.count - 1]
       for (ordinal, index) in indices.enumerated() {
         try Task.checkCancellation()
-        result = try await renderer.renderVideoFrame(frames[index].rgb, motion: temporal ? motions[index] : nil,
-          context: .init(streamID: 1, frameIndex: UInt64(ordinal)), processingScale: options.processingScale,
-          temporal: temporal, outputOptions: outputOptions, featureControls: options.profile.featureControls,
-          intensity: options.intensity)
+        result = frames[index].rgb
+        if options.renderingModel != nil, let renderer {
+          result = try await renderer.renderVideoFrame(result, motion: temporal ? motions[index] : nil,
+            context: .init(streamID: 1, frameIndex: UInt64(ordinal)), processingScale: options.processingScale,
+            temporal: temporal, outputOptions: outputOptions, featureControls: options.profile.featureControls,
+            intensity: options.intensity)
+        }
+        if let dlss {
+          result = try await dlss.upscale(result, motion: temporal ? motions[index] : nil, temporal: temporal)
+        }
       }
       try Task.checkCancellation()
       historyFrames = indices.count - 1
@@ -131,7 +151,7 @@ public actor NativeMediaPreview {
       superResolutionURL = nil
     }
     try Task.checkCancellation()
-    let processed = options.renderingModel != nil || options.superResolutionWeights != nil
+    let processed = options.renderingModel != nil || options.superResolutionWeights != nil || dlss != nil
       ? try await io.displayImage(result) : original!
     let elapsed = started.duration(to: .now).components
     return MediaPreviewResult(original: original!, processed: processed, time: selected.time.seconds,

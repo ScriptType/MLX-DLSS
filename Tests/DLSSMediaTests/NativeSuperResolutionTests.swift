@@ -4,6 +4,53 @@ import XCTest
 @testable import DLSSMedia
 
 final class NativeSuperResolutionTests: XCTestCase, @unchecked Sendable {
+  func testDLSSVideoPreviewExportAndImageRejectionWhenConfigured() async throws {
+    guard #available(macOS 26.0, *) else { throw XCTSkip("Native video requires macOS 26") }
+    guard let path = ProcessInfo.processInfo.environment["MLXDLSS_SR_MODEL"] else {
+      throw XCTSkip("Set MLXDLSS_SR_MODEL to a locally prepared .srmodel")
+    }
+    let directory = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let input = directory.appendingPathComponent("input.mp4")
+    let writer = try NativeVideoWriter(url: input, width: 96, height: 64, frameRate: 10,
+      options: MediaProcessingOptions(), hasAudio: false)
+    for index in 0..<6 {
+      try await writer.append(NativeOpticalFlowTests.texture(width: 96, height: 64, dx: index, dy: 0),
+        at: CMTime(value: Int64(index), timescale: 10))
+    }
+    try await writer.finish(at: CMTime(value: 6, timescale: 10))
+    var options = MediaProcessingOptions(dlssSuperResolutionModel: URL(fileURLWithPath: path))
+    options.motion = .vision
+    let output = directory.appendingPathComponent("output.mp4")
+    let result = try await NativeMediaProcessor().processVideo(input: input, output: output, options: options)
+    XCTAssertEqual(result.inputFrames, 6)
+    XCTAssertEqual(result.outputFrames, 6)
+    XCTAssertEqual(result.motionBackend, "vision")
+    XCTAssertGreaterThan(result.timing?.motionSeconds ?? 0, 0)
+    XCTAssertGreaterThan(result.timing?.superResolutionSeconds ?? 0, 0)
+    let reader = try await NativeVideoReader(url: output, options: MediaProcessingOptions())
+    var count = 0
+    while let frame = try await reader.next() {
+      XCTAssertEqual(frame.rgb.width, 192)
+      XCTAssertEqual(frame.rgb.height, 128)
+      XCTAssertEqual(frame.time.seconds, Double(count)/10, accuracy: 1e-5)
+      count += 1
+    }
+    XCTAssertEqual(count, 6)
+    let session = try NativeMediaPreview()
+    let request = MediaPreviewRequest(input: input, isVideo: true, time: 0.2, options: options)
+    let preview = try await session.render(request)
+    XCTAssertEqual(preview.processed.width, 192)
+    XCTAssertEqual(preview.processed.height, 128)
+    XCTAssertEqual(preview.historyFrames, 2)
+    let replay = try await session.render(request)
+    XCTAssertEqual(replay.processed.dataProvider!.data! as Data, preview.processed.dataProvider!.data! as Data)
+    do {
+      _ = try await NativeMediaProcessor().processImage(input: input, output: output, options: options)
+      XCTFail("DLSS SR must not silently process images")
+    } catch { XCTAssertTrue(error.localizedDescription.contains("requires video")) }
+  }
+
   func testImagePreviewExportAndWeightChanges() async throws {
     guard #available(macOS 26.0, *) else { throw XCTSkip("Native preview requires macOS 26") }
     let directory = try temporaryDirectory()

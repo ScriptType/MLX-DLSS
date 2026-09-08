@@ -47,8 +47,8 @@ Temporal rendering is on by default. Live preview uses up to three preceding
 frames; export uses the full sequence and applies frame generation. Native
 video output is SDR 8-bit; PNG/TIFF stills retain 16-bit output.
 
-Experimental [RTX VSR 2×](docs/super-resolution.md) also supports images, video
-and live preview, with separately prepared weights.
+Experimental [super resolution 2×](docs/super-resolution.md): DLSS SR for video,
+RTX VSR for images. Both support live preview and require separate model files.
 
 ![Native macOS app with temporal preview and frame generation](docs/assets/native-app.png)
 
@@ -77,9 +77,10 @@ The app build also creates `.build/release/mlxdlss`:
 .build/release/mlxdlss process-image in.png --output out.png --model weights/NeuralRendering.dlssmodel
 .build/release/mlxdlss process-video in.mp4 --output out.mp4 --model weights/NeuralRendering.dlssmodel
 .build/release/mlxdlss process-video in.mp4 --output out.mp4 --framegen-weights weights/framegen.safetensors --factor 2
+.build/release/mlxdlss process-video in.mp4 --output out.mp4 --sr-model weights/dlss-sr.srmodel
 ```
 
-Pass both weight options to combine effects; `--order nr-fg|fg-nr` selects their
+Combine `--model` and `--framegen-weights`; `--order nr-fg|fg-nr` selects their
 order. Video defaults to temporal rendering, automatic optical flow, H.264 and
 audio. Existing output files are preserved. [More options and APIs](docs/embedding.md#native-media-and-live-preview).
 
@@ -105,8 +106,8 @@ frame while adjusting controls. Export batches with NR/FG in either order,
 FG ×2–16, slow motion, H.264/HEVC/ProRes, audio and frame ranges. Jobs support
 cancel, retry and downloads; the output folder is configurable.
 
-On macOS 26+, images also support **Upscale 2×** with RTX VSR weights in Settings.
-Preview and export use the same Metal model.
+On macOS 26+, **Upscale 2×** uses RTX VSR for images and DLSS SR for video.
+Configure their model files in Settings; preview and export share the Metal path.
 
 Temporal is on for new videos. Preview uses up to three preceding frames;
 frame generation runs on export. Saved jobs retain their settings.

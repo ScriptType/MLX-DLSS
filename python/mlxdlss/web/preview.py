@@ -16,7 +16,7 @@ import numpy as np
 from PIL import Image
 
 from . import native
-from .effects import NeuralRender, SuperResolution, parse_effects, validate_chain
+from .effects import DLSSSuperResolution, NeuralRender, SuperResolution, parse_effects, validate_chain
 
 
 class LatestPreview:
@@ -80,22 +80,26 @@ class PreviewSession:
             validate_chain(effects, kind)
         nr = next((e for e in effects if isinstance(e, NeuralRender)), None)
         vsr = next((e for e in effects if isinstance(e, SuperResolution)), None)
+        sr = next((e for e in effects if isinstance(e, DLSSSuperResolution)), None)
         with self.runner.cache.execution_lock:
             if self.closed.is_set():
                 raise RuntimeError("Preview closed")
             settings = self.runner.settings_provider()
-            if native.available(settings, [e for e in (nr, vsr) if e is not None], source):
-                return self._native(source, kind, nr, vsr, settings, seconds)
+            if native.available(settings, [e for e in (nr, vsr, sr) if e is not None], source):
+                return self._native(source, kind, nr, vsr, settings, seconds, sr)
             self._stop_process()
+            if sr is not None:
+                raise ValueError("DLSS SR needs native Metal on macOS 26 and MP4/MOV input")
             if vsr is not None:
                 raise ValueError("RTX VSR needs native Metal on macOS 26; select Auto or Metal in Settings")
             return self._portable(source, kind, nr, settings, seconds)
 
-    def _native(self, source, kind, nr, vsr, settings, seconds):
+    def _native(self, source, kind, nr, vsr, settings, seconds, sr=None):
         from ..mlxdlss_stream import find_mlxdlss
 
         binary = find_mlxdlss(settings.mlxdlss_binary or None)
         options = native.rendering_arguments(nr, settings, video=kind == "video") + native.super_resolution_arguments(vsr, settings)
+        options += native.dlss_sr_arguments(sr, settings)
         if self.process is None or self.process.poll() is not None or self.process_key != binary:
             self._stop_process()
             self.errors = tempfile.TemporaryFile()

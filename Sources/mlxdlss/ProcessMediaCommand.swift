@@ -32,11 +32,11 @@ enum ProcessMediaCommand {
 
   static func parse(arguments: [String], video: Bool, requireEffect: Bool = true) throws -> Parsed {
     guard let input = arguments.first, !input.hasPrefix("--") else {
-      throw CLIError.usage("process-\(video ? "video" : "image") requires INPUT --output PATH and --model, --vsr-weights or --framegen-weights")
+      throw CLIError.usage("process-\(video ? "video" : "image") requires INPUT --output PATH and effect weights")
     }
     let common = ["--output", "--model", "--profile", "--precision", "--intensity",
       "--processing-scale", "--detail-strength", "--colour-strength", "--detail-radius", "--vsr-weights"]
-    let videoOptions = ["--framegen-weights", "--order", "--factor", "--temporal", "--motion",
+    let videoOptions = ["--framegen-weights", "--sr-model", "--order", "--factor", "--temporal", "--motion",
       "--scene-cut-threshold", "--slow-motion", "--audio", "--codec", "--bitrate", "--start-frame", "--frames"]
     let known = common + (video ? videoOptions : [])
     var values: [String: String] = [:]
@@ -52,7 +52,8 @@ enum ProcessMediaCommand {
     guard let output = values["--output"] else { throw CLIError.usage("native media processing requires --output PATH") }
     var options = MediaProcessingOptions(renderingModel: values["--model"].map { URL(fileURLWithPath: $0) },
       frameGenerationWeights: values["--framegen-weights"].map { URL(fileURLWithPath: $0) },
-      superResolutionWeights: values["--vsr-weights"].map { URL(fileURLWithPath: $0) })
+      superResolutionWeights: values["--vsr-weights"].map { URL(fileURLWithPath: $0) },
+      dlssSuperResolutionModel: values["--sr-model"].map { URL(fileURLWithPath: $0) })
     func float(_ key: String, _ fallback: Float) throws -> Float {
       guard let text = values[key] else { return fallback }
       guard let result = Float(text), result.isFinite else { throw CLIError.usage("\(key) requires a finite number") }
@@ -92,7 +93,7 @@ enum ProcessMediaCommand {
     if values["--frames"] != nil { options.frameLimit = try integer("--frames", 0) }
     if values["--bitrate"] != nil { options.bitrate = try integer("--bitrate", 0) }
     if requireEffect || options.renderingModel != nil || options.frameGenerationWeights != nil
-      || options.superResolutionWeights != nil {
+      || options.superResolutionWeights != nil || options.dlssSuperResolutionModel != nil {
       try options.validate()
     }
     return Parsed(input: URL(fileURLWithPath: input), output: URL(fileURLWithPath: output), options: options)

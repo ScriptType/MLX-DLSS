@@ -70,6 +70,7 @@ def effect_editor(kind: str, initial: list[dict] | None = None, *, on_change=lam
     nr0 = next((e for e in initial if e.get("kind") == "nr"), None)
     fg0 = next((e for e in initial if e.get("kind") == "fg"), None)
     vsr0 = next((e for e in initial if e.get("kind") == "vsr"), None)
+    sr0 = next((e for e in initial if e.get("kind") == "sr"), None)
     with ds.card("Neural rendering") as box:
         with box.meta:
             nr_enabled = ui.switch(value=nr0 is not None or not initial).props('dense color=primary aria-label="Enable rendering"')
@@ -111,7 +112,12 @@ def effect_editor(kind: str, initial: list[dict] | None = None, *, on_change=lam
                 first = initial[0].get("kind") if initial else "nr"
                 order = ds.segmented_row("Order", {"nr_first": "Render → generate", "fg_first": "Generate → render"},
                                          value="fg_first" if first == "fg" else "nr_first")
-    vsr_enabled = None
+    vsr_enabled = sr_enabled = None
+    if kind == "video":
+        with ds.card("Super resolution · Experimental"):
+            sr_enabled = ds.switch_row("Upscale 2×", "DLSS SR uses motion and preceding frames.", value=sr0 is not None).props('aria-label="Upscale 2×"')
+            if not settings.sr_available():
+                ui.label("Requires macOS 26, Metal and a DLSS SR model in Settings.").classes("mlxdlss-warn mlxdlss-small")
     if kind == "image":
         with ds.card("Super resolution · Experimental"):
             vsr_enabled = ds.switch_row("Upscale 2×", "RTX VSR increases image width and height by 2×.", value=vsr0 is not None).props('aria-label="Upscale 2×"')
@@ -136,10 +142,12 @@ def effect_editor(kind: str, initial: list[dict] | None = None, *, on_change=lam
                 effects.append(fg)
         if vsr_enabled is not None and vsr_enabled.value:
             effects.append({"kind": "vsr", "scale": 2})
+        if sr_enabled is not None and sr_enabled.value:
+            effects.append({"kind": "sr", "scale": 2})
         return effects
 
     for control in (nr_enabled, profile, scale, detail, colour, radius, intensity, temporal, motion, threshold,
-                    fg_enabled, fg_mode, fg_factor, fg_audio, order, vsr_enabled):
+                    fg_enabled, fg_mode, fg_factor, fg_audio, order, vsr_enabled, sr_enabled):
         if control is not None:
             control.on_value_change(lambda _: on_change())
     return chain

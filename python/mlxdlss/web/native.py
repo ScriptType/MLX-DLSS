@@ -9,7 +9,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from .effects import FrameGen, NeuralRender, OutputOptions, SuperResolution
+from .effects import DLSSSuperResolution, FrameGen, NeuralRender, OutputOptions, SuperResolution
 
 
 def available(settings, effects, source: Path) -> bool:
@@ -43,13 +43,23 @@ def super_resolution_arguments(vsr: SuperResolution | None, settings) -> list[st
     return ["--vsr-weights", str(Path(settings.vsr_weights).expanduser())]
 
 
+def dlss_sr_arguments(sr: DLSSSuperResolution | None, settings) -> list[str]:
+    if sr is None:
+        return []
+    if not settings.has_sr_model():
+        raise ValueError("Choose a DLSS SR model in Settings")
+    return ["--sr-model", str(Path(settings.sr_model).expanduser())]
+
+
 def video_arguments(source, target, effects, settings, output: OutputOptions) -> list[str]:
     from ..mlxdlss_stream import find_mlxdlss
 
     nr = next((e for e in effects if isinstance(e, NeuralRender)), None)
     fg = next((e for e in effects if isinstance(e, FrameGen)), None)
+    sr = next((e for e in effects if isinstance(e, DLSSSuperResolution)), None)
     args = [find_mlxdlss(settings.mlxdlss_binary or None), "process-video", str(source), "--output", str(target)]
     args += rendering_arguments(nr, settings, video=True)
+    args += dlss_sr_arguments(sr, settings)
     audio = output.include_audio and (fg is None or fg.audio != "none")
     args += ["--codec", output.codec, "--audio", "on" if audio else "off", "--start-frame", str(output.start_frame)]
     if output.frame_limit is not None:

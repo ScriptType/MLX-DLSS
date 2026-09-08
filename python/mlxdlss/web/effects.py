@@ -50,7 +50,15 @@ class SuperResolution(BaseModel):
     scale: Literal[2] = 2
 
 
-Effect = Annotated[Union[NeuralRender, FrameGen, SuperResolution], Field(discriminator="kind")]
+class DLSSSuperResolution(BaseModel):
+    """Temporal DLSS SR K 2× on the native Metal video path."""
+
+    model_config = {"extra": "forbid"}
+    kind: Literal["sr"] = "sr"
+    scale: Literal[2] = 2
+
+
+Effect = Annotated[Union[NeuralRender, FrameGen, SuperResolution, DLSSSuperResolution], Field(discriminator="kind")]
 EffectList = TypeAdapter(list[Effect])
 
 
@@ -74,7 +82,7 @@ def media_kind(filename: str) -> MediaKind:
     raise ValueError(f"unsupported file type '{suffix}': images {sorted(IMAGE_SUFFIXES)}, videos {sorted(VIDEO_SUFFIXES)}")
 
 
-def parse_effects(raw, *, kind: MediaKind | None = None) -> list[NeuralRender | FrameGen | SuperResolution]:
+def parse_effects(raw, *, kind: MediaKind | None = None) -> list[NeuralRender | FrameGen | SuperResolution | DLSSSuperResolution]:
     """Validate a list of effect dicts (or models) into models; raises ValueError."""
     try:
         values = [e.model_dump() if isinstance(e, BaseModel) else e.copy() if isinstance(e, dict) else e for e in raw]
@@ -87,7 +95,7 @@ def parse_effects(raw, *, kind: MediaKind | None = None) -> list[NeuralRender | 
         raise ValueError("; ".join(f"{'.'.join(str(p) for p in e['loc'])}: {e['msg']}" for e in error.errors())) from error
 
 
-def validate_chain(effects: list[NeuralRender | FrameGen | SuperResolution], kind: MediaKind) -> None:
+def validate_chain(effects: list[NeuralRender | FrameGen | SuperResolution | DLSSSuperResolution], kind: MediaKind) -> None:
     """The rules a job's effect chain must follow; raises ValueError."""
     if not effects:
         raise ValueError("choose at least one effect")
@@ -98,6 +106,14 @@ def validate_chain(effects: list[NeuralRender | FrameGen | SuperResolution], kin
     if sum(isinstance(e, NeuralRender) for e in effects) > 1:
         raise ValueError("at most one neural rendering effect per job")
     vsr = [e for e in effects if isinstance(e, SuperResolution)]
+    sr = [e for e in effects if isinstance(e, DLSSSuperResolution)]
+    if sr:
+        if kind != "video":
+            raise ValueError("DLSS SR requires video; use RTX VSR for images")
+        if len(sr) + len(vsr) > 1:
+            raise ValueError("at most one super resolution effect per job")
+        if not isinstance(effects[-1], DLSSSuperResolution):
+            raise ValueError("super resolution must be the last effect")
     if vsr:
         if kind != "image":
             raise ValueError("RTX VSR is available for images in the web app")
@@ -107,7 +123,7 @@ def validate_chain(effects: list[NeuralRender | FrameGen | SuperResolution], kin
             raise ValueError("super resolution must be the last effect")
 
 
-def describe_effects(*, mlxdlss_available: bool, fg_weights: bool, nr_weights: bool, vsr_available: bool = False) -> dict:
+def describe_effects(*, mlxdlss_available: bool, fg_weights: bool, nr_weights: bool, vsr_available: bool = False, sr_available: bool = False) -> dict:
     """What the UI/API can offer right now (field ranges and availability)."""
     return {
         "effects": [
@@ -135,6 +151,10 @@ def describe_effects(*, mlxdlss_available: bool, fg_weights: bool, nr_weights: b
             },
             {
                 "kind": "vsr", "name": "RTX VSR · Experimental", "media": ["image"], "available": vsr_available,
+                "fields": {"scale": {"type": "choice", "choices": [2], "default": 2}},
+            },
+            {
+                "kind": "sr", "name": "DLSS SR · Experimental", "media": ["video"], "available": sr_available,
                 "fields": {"scale": {"type": "choice", "choices": [2], "default": 2}},
             },
         ],

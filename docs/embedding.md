@@ -123,7 +123,7 @@ recovered graph changes; the MLX path applies such fixes at load time.
 ## Native media and live preview
 
 On macOS 26+, `DLSSMedia` owns AVFoundation decode/encode, VideoToolbox or Vision
-motion, temporal NR, FG and optional RTX VSR 2×. It requires no Python process
+motion, temporal NR, FG and optional DLSS SR / RTX VSR 2×. It requires no Python process
 or raw-frame pipe:
 
 ```swift
@@ -152,6 +152,10 @@ alone or as the last effect. It doubles the output dimensions and also applies
 to live preview. `MLXNativeSuperResolver.upscale` accepts individual native
 frames; VSR retains the reference model's RGB8 quantization.
 
+For temporal video upscaling, set `options.dlssSuperResolutionModel` to a
+prepared `.srmodel` instead. DLSS SR uses motion and recurrent history and
+runs after NR/FG. Choose one upscaler per job.
+
 `NativeMediaPreview.render(MediaPreviewRequest(input:isVideo:time:options:))`
 returns original/processed `CGImage`s, the actual selected timestamp and timing.
 Retain one preview actor to reuse weights and decoded frames. Submit requests
@@ -178,6 +182,7 @@ The native `process-video` command exposes these options in addition to the
 | `--factor 2`, `--order nr-fg\|fg-nr`, `--slow-motion on` | FG cadence/order; slow motion preserves audio pitch |
 | `--audio off` | Omit audio |
 | `--vsr-weights PATH` | RTX VSR 2× after NR and FG; also supported by `process-image` |
+| `--sr-model PATH` | Temporal DLSS SR 2× after NR and FG; video only |
 
 Original timestamps and variable frame intervals are retained. FG emits
 `(N-1)×factor+1` frames. JSON reports stage timings; stderr reports progress.

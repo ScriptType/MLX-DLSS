@@ -35,9 +35,11 @@ final class AppModel {
   var renderingEnabled = true
   var generationEnabled = false
   var superResolutionEnabled = false
+  var videoUpscaling = "dlss"
   var modelPath: String
   var generationPath: String
   var superResolutionPath: String
+  var dlssSuperResolutionPath: String
   var outputDirectory: String
   var profile: NeuralRenderingControlProfile = .standard
   var temporal = true
@@ -71,17 +73,20 @@ final class AppModel {
     modelPath = defaults.string(forKey: "renderingModel") ?? Self.locateWeight("NeuralRendering.dlssmodel")
     generationPath = defaults.string(forKey: "generationWeights") ?? Self.locateWeight("framegen.safetensors")
     superResolutionPath = defaults.string(forKey: "superResolutionWeights") ?? Self.locateWeight("vsr.safetensors")
+    dlssSuperResolutionPath = defaults.string(forKey: "dlssSuperResolutionModel") ?? Self.locateWeight("dlss-sr.srmodel")
     outputDirectory = defaults.string(forKey: "outputDirectory") ?? FileManager.default.homeDirectoryForCurrentUser
       .appendingPathComponent("MLX-DLSS/outputs").path
   }
 
   var selectedJob: MediaJob? { jobs.first { $0.id == selection } }
   var hasQueuedJobs: Bool { jobs.contains { $0.state == .queued } }
+  var usesDLSS: Bool { selectedJob?.isVideo != false && videoUpscaling == "dlss" }
+  var upscalingPath: String { usesDLSS ? dlssSuperResolutionPath : superResolutionPath }
 
   var previewRequest: MediaPreviewRequest? {
     guard !isRunning, let job = selectedJob else { return nil }
     return MediaPreviewRequest(input: job.input, isVideo: job.isVideo, time: previewTime,
-      options: options(forPreview: true))
+      options: options(forPreview: true, isVideo: job.isVideo))
   }
 
   func schedulePreview(_ request: MediaPreviewRequest?) {
@@ -107,8 +112,8 @@ final class AppModel {
           if renderingEnabled && next.request.options.renderingModel == nil {
             throw MLXMediaError("Choose a neural-rendering model to enable live rendering")
           }
-          if superResolutionEnabled && next.request.options.superResolutionWeights == nil {
-            throw MLXMediaError("Choose VSR weights to enable live upscaling")
+          if superResolutionEnabled && next.request.options.superResolutionWeights == nil && next.request.options.dlssSuperResolutionModel == nil {
+            throw MLXMediaError("Choose \(next.request.isVideo && videoUpscaling == "dlss" ? "a DLSS SR model" : "VSR weights") to enable live upscaling")
           }
           if previewSession == nil { previewSession = try NativeMediaPreview() }
           let result = try await previewSession!.render(next.request)
@@ -162,10 +167,12 @@ final class AppModel {
 
   func chooseSuperResolutionWeights() {
     let panel = NSOpenPanel()
-    panel.canChooseDirectories = false
-    panel.message = "Choose VSR 2× .safetensors weights"
+    panel.canChooseDirectories = usesDLSS
+    panel.canChooseFiles = !usesDLSS
+    panel.message = usesDLSS ? "Choose a DLSS SR .srmodel package" : "Choose VSR 2× .safetensors weights"
     if panel.runModal() == .OK, let url = panel.url {
-      superResolutionPath = url.path
+      if usesDLSS { dlssSuperResolutionPath = url.path }
+      else { superResolutionPath = url.path }
       savePaths()
     }
   }
@@ -173,11 +180,14 @@ final class AppModel {
   func runQueue() {
     guard !isRunning, hasQueuedJobs else { return }
     let queued = jobs.filter { $0.state == .queued }
-    let options: MediaProcessingOptions
+    var optionsByKind: [Bool: MediaProcessingOptions] = [:]
     do {
-      options = try processingOptions()
-      if queued.contains(where: { !$0.isVideo }), options.renderingModel == nil, options.superResolutionWeights == nil {
-        throw MLXMediaError("Enable neural rendering or super resolution to process images")
+      for isVideo in Set(queued.map(\.isVideo)) {
+        let options = try processingOptions(isVideo: isVideo)
+        if !isVideo, options.renderingModel == nil, options.superResolutionWeights == nil {
+          throw MLXMediaError("Enable neural rendering or super resolution to process images")
+        }
+        optionsByKind[isVideo] = options
       }
     } catch { alert = error.localizedDescription; return }
     savePaths()
@@ -193,6 +203,7 @@ final class AppModel {
         job.state = .running
         job.error = nil
         selection = job.id
+        let options = optionsByKind[job.isVideo]!
         do {
           let folder = directory.appendingPathComponent("native-\(job.id.uuidString.lowercased())")
           try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
@@ -226,20 +237,24 @@ final class AppModel {
   func retry(_ job: MediaJob) { job.state = .queued; job.error = nil; job.progress = nil }
   func removeFinished() { jobs.removeAll { $0.state != .running && $0.state != .queued } }
 
-  private func processingOptions() throws -> MediaProcessingOptions {
-    let options = options(forPreview: false)
+  private func processingOptions(isVideo: Bool) throws -> MediaProcessingOptions {
+    let options = options(forPreview: false, isVideo: isVideo)
     if renderingEnabled && options.renderingModel == nil { throw MLXMediaError("Choose a neural-rendering model") }
     if generationEnabled && options.frameGenerationWeights == nil { throw MLXMediaError("Choose frame-generation weights") }
-    if superResolutionEnabled && options.superResolutionWeights == nil { throw MLXMediaError("Choose VSR weights") }
+    if superResolutionEnabled && options.superResolutionWeights == nil && options.dlssSuperResolutionModel == nil {
+      throw MLXMediaError("Choose \(isVideo && videoUpscaling == "dlss" ? "a DLSS SR model" : "VSR weights")")
+    }
     try options.validate()
     return options
   }
 
-  private func options(forPreview: Bool) -> MediaProcessingOptions {
+  private func options(forPreview: Bool, isVideo: Bool) -> MediaProcessingOptions {
+    let dlss = isVideo && videoUpscaling == "dlss"
     var options = MediaProcessingOptions(
       renderingModel: renderingEnabled && !modelPath.isEmpty ? URL(fileURLWithPath: modelPath) : nil,
       frameGenerationWeights: !forPreview && generationEnabled && !generationPath.isEmpty ? URL(fileURLWithPath: generationPath) : nil,
-      superResolutionWeights: superResolutionEnabled && !superResolutionPath.isEmpty ? URL(fileURLWithPath: superResolutionPath) : nil)
+      superResolutionWeights: superResolutionEnabled && !dlss && !superResolutionPath.isEmpty ? URL(fileURLWithPath: superResolutionPath) : nil,
+      dlssSuperResolutionModel: superResolutionEnabled && dlss && !dlssSuperResolutionPath.isEmpty ? URL(fileURLWithPath: dlssSuperResolutionPath) : nil)
     options.profile = profile
     options.temporal = temporal
     options.motion = motion
@@ -265,6 +280,7 @@ final class AppModel {
     UserDefaults.standard.set(modelPath, forKey: "renderingModel")
     UserDefaults.standard.set(generationPath, forKey: "generationWeights")
     UserDefaults.standard.set(superResolutionPath, forKey: "superResolutionWeights")
+    UserDefaults.standard.set(dlssSuperResolutionPath, forKey: "dlssSuperResolutionModel")
     UserDefaults.standard.set(outputDirectory, forKey: "outputDirectory")
   }
 

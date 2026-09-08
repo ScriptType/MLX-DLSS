@@ -19,6 +19,7 @@ class Settings:
     nr_model: str = ""            # MODEL.dlssmodel for the Swift/Metal backend
     fg_weights: str = ""          # dense frame generation safetensors (mlxdlss-weights extract-fg)
     vsr_weights: str = ""         # RTX VSR safetensors (mlxdlss-weights extract-vsr)
+    sr_model: str = ""            # DLSS SR .srmodel package
     backend: str = "auto"         # auto | torch | mlxdlss
     device: str = "auto"          # torch device
     precision: str = "reference"  # torch precision for neural rendering (reference | fast ...)
@@ -74,6 +75,16 @@ class Settings:
 
         return self.has_vsr_weights() and self.mlxdlss_available() and native.available(self, [SuperResolution()], Path("image.png"))
 
+    def has_sr_model(self) -> bool:
+        root = Path(self.sr_model).expanduser()
+        return bool(self.sr_model) and all((root / name).is_file() for name in ("manifest.json", "weights.safetensors", "postprocess.metal"))
+
+    def sr_available(self) -> bool:
+        from . import native
+        from .effects import DLSSSuperResolution
+
+        return self.has_sr_model() and self.mlxdlss_available() and native.available(self, [DLSSSuperResolution()], Path("video.mp4"))
+
     # -- persistence -----------------------------------------------------------
     @property
     def path(self) -> Path:
@@ -92,7 +103,7 @@ class Settings:
                     setattr(settings, f.name, data[f.name])
         except (OSError, ValueError):
             pass
-        for key, attribute in (("MLXDLSS_NR_WEIGHTS", "nr_weights"), ("MLXDLSS_NR_MODEL", "nr_model"), ("MLXDLSS_FG_WEIGHTS", "fg_weights"), ("MLXDLSS_VSR_WEIGHTS", "vsr_weights"), ("MLXDLSS_BINARY", "mlxdlss_binary")):
+        for key, attribute in (("MLXDLSS_NR_WEIGHTS", "nr_weights"), ("MLXDLSS_NR_MODEL", "nr_model"), ("MLXDLSS_FG_WEIGHTS", "fg_weights"), ("MLXDLSS_VSR_WEIGHTS", "vsr_weights"), ("MLXDLSS_SR_MODEL", "sr_model"), ("MLXDLSS_BINARY", "mlxdlss_binary")):
             if os.environ.get(key) and not getattr(settings, attribute):
                 setattr(settings, attribute, os.environ[key])
         return settings

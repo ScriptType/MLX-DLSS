@@ -19,6 +19,7 @@ public struct MediaProcessingOptions: Equatable, Sendable {
   public var renderingModel: URL?
   public var frameGenerationWeights: URL?
   public var superResolutionWeights: URL?
+  public var dlssSuperResolutionModel: URL?
   public var order: MediaEffectOrder = .renderingThenGeneration
   public var temporal = true
   public var motion: MediaMotion = .automatic
@@ -38,15 +39,20 @@ public struct MediaProcessingOptions: Equatable, Sendable {
   public var frameLimit: Int?
   public var precision: MLXComputePrecision = .float16
 
-  public init(renderingModel: URL? = nil, frameGenerationWeights: URL? = nil, superResolutionWeights: URL? = nil) {
+  public init(renderingModel: URL? = nil, frameGenerationWeights: URL? = nil, superResolutionWeights: URL? = nil,
+    dlssSuperResolutionModel: URL? = nil) {
     self.renderingModel = renderingModel
     self.frameGenerationWeights = frameGenerationWeights
     self.superResolutionWeights = superResolutionWeights
+    self.dlssSuperResolutionModel = dlssSuperResolutionModel
   }
 
   public func validate() throws {
-    guard renderingModel != nil || frameGenerationWeights != nil || superResolutionWeights != nil else {
+    guard renderingModel != nil || frameGenerationWeights != nil || superResolutionWeights != nil || dlssSuperResolutionModel != nil else {
       throw MLXMediaError("Select neural rendering, frame generation or super resolution weights")
+    }
+    guard superResolutionWeights == nil || dlssSuperResolutionModel == nil else {
+      throw MLXMediaError("Choose one upscaler: DLSS SR or RTX VSR")
     }
     guard processingScale.isFinite, (1...4).contains(processingScale),
       detailStrength.isFinite, (0...8).contains(detailStrength),

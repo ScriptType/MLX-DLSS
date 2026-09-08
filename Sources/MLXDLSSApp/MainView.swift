@@ -226,7 +226,7 @@ private struct ProcessingControls: View {
           Text("Zero (diagnostic)").tag(MediaMotion.zero)
         }
         valueSlider("Scene cut threshold", value: $model.cutThreshold, range: 0...1)
-      }.disabled(!model.renderingEnabled || model.selectedJob?.isVideo == false)
+      }.disabled((!model.renderingEnabled && !(model.superResolutionEnabled && model.usesDLSS)) || model.selectedJob?.isVideo == false)
       Section("Frame Generation") {
         Toggle("Generate frames", isOn: $model.generationEnabled)
         Button(model.generationPath.isEmpty ? "Choose Weights…" : URL(fileURLWithPath: model.generationPath).lastPathComponent) {
@@ -243,10 +243,16 @@ private struct ProcessingControls: View {
       }.disabled(model.selectedJob?.isVideo == false)
       Section("Super Resolution · Experimental") {
         Toggle("Upscale 2×", isOn: $model.superResolutionEnabled)
-        Button(model.superResolutionPath.isEmpty ? "Choose VSR Weights…" : URL(fileURLWithPath: model.superResolutionPath).lastPathComponent) {
+        if model.selectedJob?.isVideo != false {
+          Picker("Video upscaler", selection: $model.videoUpscaling) {
+            Text("DLSS SR · Temporal").tag("dlss")
+            Text("RTX VSR").tag("vsr")
+          }
+        }
+        Button(model.upscalingPath.isEmpty ? "Choose \(model.usesDLSS ? "DLSS SR Model" : "VSR Weights")…" : URL(fileURLWithPath: model.upscalingPath).lastPathComponent) {
           model.chooseSuperResolutionWeights()
-        }.help(model.superResolutionPath).lineLimit(1)
-        Text("RTX VSR · High Bitrate Low. Applied after rendering and frame generation.")
+        }.help(model.upscalingPath).lineLimit(1)
+        Text(model.usesDLSS ? "DLSS SR uses motion and preceding frames." : "RTX VSR · High Bitrate Low.")
           .font(.caption).foregroundStyle(.secondary)
       }
       Section("Output") {

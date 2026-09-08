@@ -14,7 +14,7 @@ from typing import Callable
 import numpy as np
 
 from ..video import find_tool, probe
-from .effects import FrameGen, NeuralRender, OutputOptions, SuperResolution, parse_effects, validate_chain
+from .effects import DLSSSuperResolution, FrameGen, NeuralRender, OutputOptions, SuperResolution, parse_effects, validate_chain
 from .jobs import Job
 from .settings import Settings
 
@@ -139,11 +139,14 @@ class JobRunner:
         # An explicit legacy slowmo/copy choice keeps its original audio semantics.
         legacy_audio = any(isinstance(e, FrameGen) and e.mode == "slowmo" and e.audio == "copy"
                            and output.include_audio for e in effects)
+        sr = next((e for e in effects if isinstance(e, DLSSSuperResolution)), None)
+        if sr is not None and (not native.available(settings, effects, source) or legacy_audio):
+            raise ValueError("DLSS SR needs native Metal on macOS 26, MP4/MOV input and native motion; slow motion uses Stretch or Drop audio")
         if native.available(settings, effects, source) and not legacy_audio:
             report("native media processing", 0.02, 0, None)
             result = native.run_media(native.video_arguments(source, target, effects, settings, output), report, should_stop)
             nr = next((e for e in effects if isinstance(e, NeuralRender)), None)
-            job.diagnostics = {"temporal": bool(nr and nr.temporal), "motion": result["motionBackend"],
+            job.diagnostics = {"temporal": bool(nr.temporal if nr else sr), "motion": result["motionBackend"],
                                "processing_scale": nr.processing_scale if nr else 1,
                                "scene_cuts": result["sceneResets"], "timing": result.get("timing"), "pipeline": "native"}
             report("done", 1, result["inputFrames"], result["inputFrames"])

@@ -15,6 +15,7 @@ public actor NativeMediaProcessor {
     guard options.frameGenerationWeights == nil else {
       throw MLXMediaError("Frame generation requires video")
     }
+    guard options.dlssSuperResolutionModel == nil else { throw MLXMediaError("Use RTX VSR for images; DLSS SR requires video") }
     busy = true
     defer { busy = false }
     let start = ContinuousClock.now
@@ -61,6 +62,9 @@ public actor NativeMediaProcessor {
     let generator = try options.frameGenerationWeights.map { try MLXNativeFrameGenerator(weightsURL: $0,
       precision: options.precision == .float16 ? .float16 : .float32) }
     let upscaler = try options.superResolutionWeights.map { try MLXNativeSuperResolver(weightsURL: $0) }
+    let dlss = try options.dlssSuperResolutionModel.map { try MLXNativeDLSSSuperResolver(packageURL: $0) }
+    let srFlow = options.temporal && dlss != nil
+      ? try NativeOpticalFlow(width: width, height: height, mode: options.motion) : nil
     let flow = options.temporal && renderer != nil
       ? try NativeOpticalFlow(width: width, height: height, mode: options.motion) : nil
     let factor = generator == nil ? 1 : options.frameGenerationFactor
@@ -75,7 +79,7 @@ public actor NativeMediaProcessor {
       attributes: [.posixPermissions: 0o700])
     defer { try? FileManager.default.removeItem(at: staging) }
     let temporary = staging.appendingPathComponent(output.lastPathComponent)
-    let scale = upscaler == nil ? 1 : 2
+    let scale = upscaler == nil && dlss == nil ? 1 : 2
     let writer = try NativeVideoWriter(url: temporary, width: width * scale, height: height * scale,
       frameRate: Double(reader.nominalFrameRate) * Double(factor) / Double(timeScale), options: options, hasAudio: audio != nil)
     // Each receiver can suspend until the other track advances. Feeding audio
@@ -119,6 +123,15 @@ public actor NativeMediaProcessor {
     func emit(_ frame: MLXVideoFrame, sourceTime: CMTime, isolation: isolated (any Actor)? = #isolation) async throws {
       try Task.checkCancellation()
       var frame = frame
+      if let dlss {
+        let motionStarted = ContinuousClock.now
+        let motion = try await srFlow?.prepare(frame, index: outputFrames, sceneCutThreshold: options.sceneCutThreshold)
+        if srFlow != nil { timing.motionSeconds += seconds(since: motionStarted) }
+        if renderer == nil && motion?.reset == true { resets += 1 }
+        let upscalingStarted = ContinuousClock.now
+        frame = try await dlss.upscale(frame, motion: motion, temporal: options.temporal)
+        timing.superResolutionSeconds = (timing.superResolutionSeconds ?? 0) + seconds(since: upscalingStarted)
+      }
       if let upscaler {
         let upscalingStarted = ContinuousClock.now
         frame = try await upscaler.upscale(frame)
@@ -189,7 +202,7 @@ public actor NativeMediaProcessor {
       await reader.cancel()
       await audio?.cancel()
       return MediaProcessingResult(output: output, inputFrames: inputFrames, outputFrames: outputFrames,
-        sceneResets: resets, elapsedSeconds: seconds(since: started), motionBackend: flow?.backend ?? "disabled", timing: timing)
+        sceneResets: resets, elapsedSeconds: seconds(since: started), motionBackend: srFlow?.backend ?? flow?.backend ?? "disabled", timing: timing)
     } catch {
       audioTask.cancel()
       await writer.cancel()
