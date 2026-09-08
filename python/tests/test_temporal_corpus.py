@@ -1,9 +1,11 @@
 import json
-import stat
+import sys
 import tempfile
 import unittest
 from fractions import Fraction
 from pathlib import Path
+from subprocess import CalledProcessError, run as subprocess_run
+from unittest.mock import patch
 
 import cv2
 import numpy as np
@@ -160,6 +162,12 @@ class KnownMotionCorpusTests(unittest.TestCase):
 
 
 class BenchmarkContractTests(unittest.TestCase):
+    @staticmethod
+    def _run_fake_ffmpeg(command, **kwargs):
+        # Windows cannot launch a Python script via its shebang. Keep a real
+        # child process and its pipe/file effects, using the current interpreter.
+        return subprocess_run([sys.executable, *command], **kwargs)
+
     def test_known_motion_metric_rewards_advected_effect_and_penalizes_screen_space_stale_effect(self):
         previous_source = textured_frame(64, 80)
         current_source = translate(previous_source, 3, 0)
@@ -209,37 +217,36 @@ class BenchmarkContractTests(unittest.TestCase):
     def test_preview_uses_exact_fractional_source_rate(self):
         with tempfile.TemporaryDirectory() as directory:
             directory = Path(directory)
-            executable = directory / "fake-ffmpeg"
+            executable = directory / "fake_ffmpeg.py"
             executable.write_text(
-                "#!/usr/bin/env python3\n"
                 "import pathlib, sys\n"
                 "sys.stdin.buffer.read()\n"
                 "pathlib.Path(sys.argv[-1]).write_text(sys.argv[sys.argv.index('-r') + 1])\n"
             )
-            executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
             output = directory / "preview.mp4"
 
-            benchmark.encode_preview(np.zeros((2, 8, 8, 3), np.float32), output, Fraction(24000, 1001), ffmpeg=str(executable))
+            with patch.object(benchmark.subprocess, "run", new=self._run_fake_ffmpeg):
+                benchmark.encode_preview(np.zeros((2, 8, 8, 3), np.float32), output, Fraction(24000, 1001), ffmpeg=str(executable))
 
             self.assertEqual(output.read_text(), "24000/1001")
 
     def test_failed_preview_removes_partial_artifacts(self):
         with tempfile.TemporaryDirectory() as directory:
             directory = Path(directory)
-            executable = directory / "fake-ffmpeg"
+            executable = directory / "fake_ffmpeg.py"
             executable.write_text(
-                "#!/usr/bin/env python3\n"
                 "import pathlib, sys\n"
                 "sys.stdin.buffer.read()\n"
                 "pathlib.Path(sys.argv[-1]).write_bytes(b'partial')\n"
                 "raise SystemExit(7)\n"
             )
-            executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
             output = directory / "preview.mp4"
 
-            with self.assertRaises(Exception):
-                benchmark.encode_preview(np.zeros((2, 8, 8, 3), np.float32), output, Fraction(30, 1), ffmpeg=str(executable))
+            with patch.object(benchmark.subprocess, "run", new=self._run_fake_ffmpeg):
+                with self.assertRaises(CalledProcessError) as failure:
+                    benchmark.encode_preview(np.zeros((2, 8, 8, 3), np.float32), output, Fraction(30, 1), ffmpeg=str(executable))
 
+            self.assertEqual(failure.exception.returncode, 7)
             self.assertFalse(output.exists())
             self.assertEqual(list(directory.glob("*.partial.*")), [])
 
