@@ -39,7 +39,12 @@ public actor NativeOpticalFlow {
       guard #available(macOS 15.4, *), VTOpticalFlowConfiguration.isSupported else {
         throw MLXMediaError("VideoToolbox optical flow is unavailable on this Mac")
       }
-      session = try VideoToolboxFlowSession(width: workingWidth, height: workingHeight)
+      do {
+        session = try VideoToolboxFlowSession(width: workingWidth, height: workingHeight)
+      } catch let error as VTFrameProcessorError where mode == .automatic && error.code == .initializationFailed {
+        // A VM can advertise support without a working frame-processor driver.
+        selected = .vision
+      }
     }
     self.mode = selected
     backend = selected.rawValue

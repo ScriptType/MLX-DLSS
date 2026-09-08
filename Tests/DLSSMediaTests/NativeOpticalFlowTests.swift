@@ -12,7 +12,15 @@ final class NativeOpticalFlowTests: XCTestCase, @unchecked Sendable {
     guard #available(macOS 15.4, *), VTOpticalFlowConfiguration.isSupported else {
       throw XCTSkip("VideoToolbox optical flow is unavailable")
     }
-    try await checkTranslation(mode: .videoToolbox)
+    do {
+      try await checkTranslation(mode: .videoToolbox)
+    } catch let error as VTFrameProcessorError where error.code == .initializationFailed {
+      throw XCTSkip("VideoToolbox cannot start its hardware processing pipeline")
+    }
+  }
+
+  func testAutomaticBackendComputesMotion() async throws {
+    try await checkTranslation(mode: .automatic)
   }
 
   func testVisionDirectionAndUnits() async throws {
@@ -22,6 +30,7 @@ final class NativeOpticalFlowTests: XCTestCase, @unchecked Sendable {
   private func checkTranslation(mode: MediaMotion) async throws {
     let width = 512, height = 384
     let estimator = try NativeOpticalFlow(width: width, height: height, mode: mode)
+    XCTAssertTrue([MediaMotion.videoToolbox.rawValue, MediaMotion.vision.rawValue].contains(estimator.backend))
     let previous = try Self.texture(width: width, height: height, dx: 0, dy: 0)
     let current = try Self.texture(width: width, height: height, dx: 8, dy: -4)
     let first = try await estimator.prepare(previous, index: 0, sceneCutThreshold: 0.3)
@@ -35,7 +44,7 @@ final class NativeOpticalFlowTests: XCTestCase, @unchecked Sendable {
       vertical.append(vectors[(y * width + x) * 2 + 1] * Float(height))
     } }
     let dx = horizontal.sorted()[horizontal.count / 2], dy = vertical.sorted()[vertical.count / 2]
-    print("native flow \(mode.rawValue): dx=\(dx), dy=\(dy), coverage=\(motion.reliableFraction), error=\(motion.warpedLumaError)")
+    print("native flow \(estimator.backend) (\(mode.rawValue)): dx=\(dx), dy=\(dy), coverage=\(motion.reliableFraction), error=\(motion.warpedLumaError)")
     XCTAssertEqual(dx, -8, accuracy: 0.7)
     XCTAssertEqual(dy, 4, accuracy: 0.7)
     XCTAssertGreaterThan(motion.reliableFraction, 0.5)

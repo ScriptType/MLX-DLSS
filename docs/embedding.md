@@ -154,10 +154,72 @@ app does. Video preview uses up to three preceding frames and a fresh temporal
 history per request; FG is reserved for export. Preview and export should share
 one scheduling lane so they do not compete for the GPU.
 
-## Performance expectations
+The native `process-video` command exposes these options in addition to the
+[rendering controls](../README.md#cli):
 
-Use the [paired measurements in the README](../README.md#accuracy-and-speed)
-for the current Metal path. Processing scale increases the network's pixel
-count quadratically; moving display composition and NR → FG onto Metal reduces
-transfer and CPU work while preserving that model cost. Measure the complete
-frame loop at the intended extent, precision and output format.
+| Options | Behavior |
+| --- | --- |
+| `--temporal on\|off`, `--motion automatic\|vision\|videotoolbox\|zero` | History and motion backend; Automatic falls back to Vision if VT cannot start |
+| `--scene-cut-threshold 0.3` | Reset unreliable history; 0 disables automatic resets |
+| `--start-frame N`, `--frames N` | Select an input range |
+| `--codec h264\|hevc\|prores`, `--bitrate BPS` | Encoder; ProRes requires MOV |
+| `--factor 2`, `--order nr-fg\|fg-nr`, `--slow-motion on` | FG cadence/order; slow motion preserves audio pitch |
+| `--audio off` | Omit audio |
+
+Original timestamps and variable frame intervals are retained. FG emits
+`(N-1)×factor+1` frames. JSON reports stage timings; stderr reports progress.
+Native video is SDR 8-bit sRGB; PNG/TIFF exports retain 16 bits. The Python
+adapter supports custom FFmpeg arguments and RGB16 video.
+
+## Performance
+
+M2 Max, 38-core GPU, real weights. Processing scale increases network pixel
+count quadratically. Compare complete frame loops at the same scale and output
+format; warm kernel timings exclude media I/O and startup.
+
+Same 228-frame 512×384, 60 fps clip, temporal rendering, detail 2:
+
+| Path | Whole clip | Input frames/s |
+| --- | --- | --- |
+| Before the earlier optimizations | 18.4–22.8 s | 10.0–12.4 |
+| Earlier optimized Python/Metal pipeline | 10.1–16.1 s | 14.2–22.6 |
+| Native pipeline | 11.33–12.36 s | 18.4–20.1 |
+
+Desktop load varied across days; these ranges are not a paired speedup claim.
+Earlier alternating runs showed about 1.4× throughput. The latest four native
+A/B runs showed another 4–9% with global attention/graph caching enabled, versus
+11.77–13.43 s disabled. All four decoded RGB streams had the same SHA-256.
+They ran without an executable search path. Decode/encode took 0.37–0.48 s,
+motion 3.19–3.32 s, NR 7.06–7.73 s; peak process footprint was 1.54–1.81 GB.
+
+Short global attention sequences use on-chip tiles and cached MLX graphs while
+preserving full spatial context, half denominators and E4M3 publication.
+Before graph caching, eight blocks took 3.79 vs 4.85–5.51 ms at 48 tokens, and
+21.59 vs 24.26–24.92 ms at 510 tokens, with exact output matches. Larger
+sequences retain materialized attention. `MLXDLSS_STREAMED_GLOBAL_ATTENTION=0`
+and `MLXDLSS_COMPILE_GLOBAL=0` disable the optimizations; forcing streamed
+attention with `=1` above 512 tokens saves memory but was slower on this GPU.
+See [NR/FG chain](frame-generation.md#gpu-video-chain) and
+[FG output-head fusion](frame-generation.md#native-output-head-fusion) for
+warm timings, including the additional 18–22% FG throughput gain.
+
+Memory: the earlier Metal still-image path used 2.2 GB resident at 4K.
+PyTorch float32 used about 1 GB per megapixel of network input; `fast` precision
+roughly halves it. Bounded chunks prevent window count from growing the peak
+(`MLXDLSS_TORCH_CHUNK_TOKENS`, 0 disables). PyTorch was within 0.002 MAE of Metal;
+Core ML was within 0.008–0.014 MAE of the vendor captures.
+
+Experiments excluded from the default path:
+
+- **FP8 packing:** exact weight decode/GEMM took 0.54–2.90 ms vs MLX's
+  0.25–0.84 ms. Packing window intermediates halved storage but gave no speed
+  gain: three 1088×1920 blocks took 50.97 vs 50.46–50.61 ms.
+- **ANE:** direct [ANEForge](https://github.com/sbryngelson/ANEForge) dispatch
+  of the 1024→4096 projection took 0.30/0.51/1.04 ms at 48/192/768 tokens vs
+  Metal's 0.27/0.35/0.73 ms, excluding copies; max half-output error was 0.001.
+  Core ML chose ANE at 192 tokens (1.05 ms including Python prediction) and CPU
+  at 48. These layer probes do not validate the whole network on ANE.
+- **Temporal feature reuse:** updating the global latent every other frame
+  added 0.0037–0.0072 mean RGB error, max 0.064, on 16 frames. A linear correction
+  did not help. This used fresh encoder inputs and independent-frame rendering;
+  a learned replacement needs a separate training corpus and temporal quality gate.

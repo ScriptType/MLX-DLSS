@@ -13,9 +13,13 @@ mlxdlss-torch run --weights weights/dlssnr-weights-logical.safetensors --input i
 ```
 
 ```python
-from mlxdlss import NeuralRenderingPipeline
+from mlxdlss import NeuralRenderingPipeline, TemporalSession, FrameGenerator
 pipeline = NeuralRenderingPipeline.from_safetensors("weights/dlssnr-weights-logical.safetensors", device="auto")
 result = pipeline.enhance(image_float32_hwc, profile="standard", processing_scale=2, detail_strength=2)
+session = TemporalSession(pipeline)
+frame = session.process(image_float32_hwc)  # optional motion=engine_uv_offsets
+generator = FrameGenerator.from_safetensors("weights/framegen.safetensors", device="auto")
+middle = generator.generate(frame_a_uint8, frame_b_uint8, factor=2)[0]
 ```
 
 `precision="reference"` (default) computes in float32 with the recovered
@@ -28,7 +32,32 @@ New video jobs and `mlxdlss-video convert` enable temporal rendering by default.
 DIS flow to reproject rendered history, rejects unreliable correspondence, and
 resets on scene changes. Scales 1–4 work on both PyTorch and the rebuilt Metal
 stream; history is retained before display detail enhancement. Existing saved
-jobs retain their explicit settings. See the repository README for controls.
+jobs retain their explicit settings. See the [rendering controls](../README.md#cli).
+
+## Video CLI and web UI
+
+Video requires `ffmpeg` and `ffprobe` in `PATH`:
+
+```sh
+mlxdlss-video convert in.mp4 out.mp4 --weights weights/dlssnr-weights-logical.safetensors --device cuda
+mlxdlss-video convert in.mp4 out.mp4 --backend mlxdlss --model weights/NeuralRendering.dlssmodel --encode-args "-c:v libx265 -crf 20"
+mlxdlss-video framegen in.mp4 out.mp4 --weights weights/framegen.safetensors --backend mlxdlss
+mlxdlss-video framegen in.mp4 slow.mp4 --weights weights/framegen.safetensors --mode slowmo --factor 4 --audio stretch
+mlxdlss-web
+```
+
+`--start-frame` and `--frames` select a range; `--decode-args` and `--encode-args`
+pass FFmpeg options. `--pix-fmt rgb48le` retains 16-bit sources. Default encoding
+is H.264 CRF 18, medium preset, yuv420p. FG's `fps` mode keeps duration; `slowmo`
+stretches it, with `--audio copy|stretch|none` controlling sound.
+
+Web jobs run one at a time and save to `~/MLX-DLSS/outputs/<job>/`. The web UI
+shows completed results; live settings previews are currently SwiftUI-only.
+`mlxdlss-web --native` is a Python/pywebview window. See [HTTP routes](mlxdlss/web/api.py)
+and the [image](../docs/assets/web-image.png), [video](../docs/assets/web-video.png)
+and [queue](../docs/assets/web-jobs.png) screenshots.
+
+## Metal streaming
 
 Temporal video prepares one following frame on a CPU worker while rendering
 the current frame (`--no-prefetch` disables this). The Metal adapter uses stream
