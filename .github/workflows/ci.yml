@@ -58,7 +58,8 @@ jobs:
             Tests/ToolsTests/test_neural_rendering_reference.py \
             Tests/ToolsTests/test_convert_neural_rendering_coreml.py
           .build/ci-python/bin/python -m pip install './python[web,video]'
-          PYTHONPATH=python .build/ci-python/bin/python -m unittest \
+          MTL_DEBUG_LAYER=1 MTL_DEBUG_LAYER_VALIDATE_UNRETAINED_RESOURCES=5 \
+            PYTHONPATH=python .build/ci-python/bin/python -m unittest -v \
             python.tests.test_mlxdlss_stream
 
   python:

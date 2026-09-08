@@ -45,6 +45,31 @@ final class NeuralRenderingFusedWindowAttentionTests: XCTestCase {
     }
   }
 
+  func testDifferentHeadCountsCanShareOneLazyGraph() {
+    var outputs: [MLXArray] = []
+    for heads in [2, 4, 8, 16, 4] {
+      let shape = [1, 8, 8, heads * 32]
+      let qkv = concatenated([
+        MLXArray.zeros(shape, dtype: .float16),
+        MLXArray.zeros(shape, dtype: .float16),
+        MLXArray.full(shape, values: MLXArray(Float(0.25)), dtype: .float16),
+      ], axis: -1)
+      let scale = MLXArray.ones([heads], dtype: .float16)
+      let bias = MLXArray.zeros([heads, 64, 64], dtype: .float16)
+      eval(qkv, scale, bias)
+      outputs.append(NeuralRenderingFusedWindowAttention.apply(
+        qkv: qkv, attentionScale: scale, attentionBias: bias,
+        headCount: heads, windowOrigin: .zero))
+    }
+    // Keep every variant pending, as in a full NR graph. Evaluating each one
+    // separately would hide premature pipeline eviction at the 4/8-head boundary.
+    eval(outputs)
+    for output in outputs {
+      XCTAssertEqual(output.asType(.float32).asArray(Float.self),
+        [Float](repeating: 0.25, count: output.size))
+    }
+  }
+
   /// The dense arrangement of the branched feed-forward must agree with the
   /// per-group reference up to accumulation order: the E4M3 publication makes
   /// individual elements flip by one E4M3 step, so the gate is on the mean.

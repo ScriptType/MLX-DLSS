@@ -322,6 +322,10 @@ enum NeuralRenderingFusedWindowAttention {
         qkv, attentionScale.asType(.float16), attentionBias.asType(.float16).reshaped([headCount * 64 * 64]),
         params,
       ],
+      // MLX 0.31 uses constant pointers for inputs smaller than eight elements.
+      // Separate the two scale signatures so its cache never evicts a pipeline
+      // still referenced by an encoded dispatch with another head count.
+      template: [("constantAttentionScale", headCount < 8)],
       grid: (threadgroups * 32 * simdgroupsPerWindow, 1, 1),
       threadGroup: (32 * simdgroupsPerWindow, 1, 1),
       outputShapes: [[1, height, width, channels]],
