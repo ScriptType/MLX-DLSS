@@ -9,6 +9,8 @@ import MLX
 enum FrameGenerationFusedConv {
   /// `MLXDLSS_FG_FUSED=0` runs the MLX convolutions (diagnostics).
   nonisolated(unsafe) static var enabled: Bool = ProcessInfo.processInfo.environment["MLXDLSS_FG_FUSED"] != "0"
+  /// Fold the linear output head's bilinear input fetch into the convolution.
+  nonisolated(unsafe) static var fusedUpsampleEnabled: Bool = ProcessInfo.processInfo.environment["MLXDLSS_FG_FUSED_UPSAMPLE"] != "0"
 
   static let kernel = MLXFast.metalKernel(
     name: "mlxdlss_fg_conv3x3",
@@ -40,7 +42,8 @@ enum FrameGenerationFusedConv {
       const bool pool = (flags & 4u) != 0u;
       const int span = pool ? 2 : 1;
       const int cin4 = cin / 4;
-      const device half4* input4 = (const device half4*)input + n * height * width * cin4;
+      const int sourceHeight = height / inputScale, sourceWidth = width / inputScale;
+      const device half4* input4 = (const device half4*)input + n * sourceHeight * sourceWidth * cin4;
       const device half* res = residual + n * height * width * cout;
       const device half4* weight4 = (const device half4*)weight;
       float acc[8];
@@ -55,10 +58,23 @@ enum FrameGenerationFusedConv {
             const int iy = y + tap / 3 - 1;
             const int ix = x + tap % 3 - 1;
             if (iy < 0 || iy >= height || ix < 0 || ix >= width) { continue; }
-            const device half4* row = input4 + (iy * width + ix) * cin4;
             const device half4* w = weight4 + (tap * cin4) * cout + group * 8;
             for (int k = 0; k < cin4; ++k) {
-              const float4 v = float4(row[k]);
+              float4 v;
+              if (inputScale == 2) {
+                const float sx = max((float(ix) + 0.5f) * 0.5f - 0.5f, 0.0f);
+                const float sy = max((float(iy) + 0.5f) * 0.5f - 0.5f, 0.0f);
+                const int x0 = min(int(sx), sourceWidth - 1), x1 = min(x0 + 1, sourceWidth - 1);
+                const int y0 = min(int(sy), sourceHeight - 1), y1 = min(y0 + 1, sourceHeight - 1);
+                const float tx = sx - float(x0), ty = sy - float(y0);
+                const float4 v00 = float4(input4[(y0 * sourceWidth + x0) * cin4 + k]);
+                const float4 v01 = float4(input4[(y0 * sourceWidth + x1) * cin4 + k]);
+                const float4 v10 = float4(input4[(y1 * sourceWidth + x0) * cin4 + k]);
+                const float4 v11 = float4(input4[(y1 * sourceWidth + x1) * cin4 + k]);
+                v = float4(half4((1 - tx) * (1 - ty) * v00 + tx * (1 - ty) * v01 + (1 - tx) * ty * v10 + tx * ty * v11));
+              } else {
+                v = float4(input4[(iy * width + ix) * cin4 + k]);
+              }
               const device half4* wk = w + k * cout;
               for (int c = 0; c < 8; ++c) {
                 part[c] += dot(v, float4(wk[c]));
@@ -237,13 +253,14 @@ enum FrameGenerationFusedConv {
   }
 
   /// `x` [N,H,W,cin] fp16 (cin == layer.cin) -> [N,H,W,cout] or [N,H/2,W/2,cout] with `pool`.
-  static func apply(_ x: MLXArray, _ layer: Layer, activation: Bool, residual: MLXArray? = nil, pool: Bool = false) -> MLXArray {
+  static func apply(_ x: MLXArray, _ layer: Layer, activation: Bool, residual: MLXArray? = nil, pool: Bool = false, upsample: Bool = false) -> MLXArray {
     precondition(x.dim(3) == layer.cin, "fused conv expects \(layer.cin) input channels, got \(x.dim(3))")
-    let (n, h, w) = (x.dim(0), x.dim(1), x.dim(2))
+    let inputScale = upsample ? 2 : 1
+    let (n, h, w) = (x.dim(0), x.dim(1) * inputScale, x.dim(2) * inputScale)
     if pool && (h < 2 || w < 2) {
       return MLXArray.zeros([n, h / 2, w / 2, layer.cout], dtype: .float16)
     }
-    if useSIMD(x, layer, pool: pool) {
+    if !upsample && useSIMD(x, layer, pool: pool) {
       let y = applySimd(x, layer, activation: activation, residual: residual)
       return pool ? FrameGenerator.meanPool2(y[0..., 0..<(h / 2 * 2), 0..<(w / 2 * 2), 0...]) : y
     }
@@ -256,7 +273,7 @@ enum FrameGenerationFusedConv {
     let res = residual ?? layer.bias   // any array when unused; never read
     return kernel(
       [contiguous(x.asType(.float16)), layer.packed, layer.bias, contiguous(res.asType(.float16)), params],
-      template: [("inputChannels", layer.cin), ("outputChannels", layer.cout), ("epilogueFlags", Int(flags))],
+      template: [("inputChannels", layer.cin), ("outputChannels", layer.cout), ("epilogueFlags", Int(flags)), ("inputScale", inputScale)],
       grid: (count, 1, 1),
       threadGroup: (min(count, 256), 1, 1),
       outputShapes: [[n, outH, outW, layer.cout]],

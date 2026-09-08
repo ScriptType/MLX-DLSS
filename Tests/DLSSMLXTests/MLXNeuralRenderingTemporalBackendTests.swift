@@ -159,6 +159,24 @@ final class MLXNeuralRenderingTemporalBackendTests: XCTestCase {
     }
   }
 
+  func testLiveIntensityValuesCanShareOnePendingGraph() {
+    let values: [Float] = [0, 0.2, 0.8, 1, 2, 0.4]
+    let current: [Float] = [0.25, 0.5, 0.75]
+    let predictions: [Float] = [0.375, 0.375, 0.8125]
+    let input = MLXArray(current, [1, 1, 1, 3])
+    let head = MLXArray([Float(0.5), -0.5, 0.25, 0], [1, 1, 1, 4])
+    let features = MLXArray.zeros([1, 1, 1, 16])
+    let processor = MLXTemporalPostprocessor()
+    let outputs = values.map {
+      processor(head: head, currentColor: input, features: features, hasHistory: false, intensity: $0)
+    }
+    eval(outputs)
+    for (value, output) in zip(values, outputs) {
+      let expected = zip(current, predictions).map { $0 + min(1, value) * ($1 - $0) }
+      XCTAssertEqual(output.asArray(Float.self), expected)
+    }
+  }
+
   func testDeviceBaseFeatureKernelMatchesPortableFeatureContract() throws {
     let color = try smallTensor(
       name: "color",

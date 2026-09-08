@@ -43,6 +43,15 @@ jobs:
         shell: bash
         run: scripts/verify.sh
 
+      - name: Build native macOS app
+        shell: bash
+        run: |
+          scripts/build-native-app.sh
+          if otool -L '.build/MLX DLSS.app/Contents/MacOS/MLXDLSSApp' | grep -i python; then
+            echo 'The native app must not link Python' >&2
+            exit 1
+          fi
+
       - name: Select Python 3.12
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:

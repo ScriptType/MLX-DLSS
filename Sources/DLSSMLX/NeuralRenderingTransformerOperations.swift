@@ -612,29 +612,25 @@ struct NeuralRenderingLinearWeight {
 }
 
 struct NeuralRenderingGlobalBlock {
-  private let expansionWeight: NeuralRenderingLinearWeight
-  private let feedForwardProjectionWeight: NeuralRenderingLinearWeight
-  private let feedForwardCosine: MLXArray
-  private let qkvWeight: MLXArray
-  private let attentionScale: MLXArray
-  private let attentionProjectionWeight: MLXArray
-  private let attentionCosine: MLXArray
-  private let preciseAttention: Bool
+  private let body: (MLXArray) -> MLXArray
+  private let compiledBody: ((MLXArray) -> MLXArray)?
 
   init(
     weights: ValidatedWeights,
     blockIndex: Int,
     quantizeFFN: Bool = false,
-    preciseAttention: Bool = true
+    preciseAttention: Bool = true,
+    fusedOperations: Bool = false,
+    compileGraph: Bool = false
   ) throws {
     let prefix = "block\(blockIndex)"
-    self.expansionWeight = NeuralRenderingLinearWeight(
+    let expansionWeight = NeuralRenderingLinearWeight(
       try Self.require(
         weights, name: "\(prefix).layer0.weight", shape: [1024, 4096]
       ),
       quantize: quantizeFFN
     )
-    self.feedForwardProjectionWeight = NeuralRenderingLinearWeight(
+    let feedForwardProjectionWeight = NeuralRenderingLinearWeight(
       try Self.require(
         weights, name: "\(prefix).layer1.weight", shape: [4096, 1024]
       )
@@ -642,14 +638,13 @@ struct NeuralRenderingGlobalBlock {
     let feedForwardCosine = try Self.require(
       weights, name: "\(prefix).layer1.ffn_cos_skip", shape: [1024]
     )
-    self.feedForwardCosine = feedForwardCosine
-    self.qkvWeight = try Self.require(
+    let qkvWeight = try Self.require(
       weights, name: "\(prefix).layer2.qkv_weight", shape: [1024, 3072]
     )
-    self.attentionScale = try Self.require(
+    let attentionScale = try Self.require(
       weights, name: "\(prefix).layer2.attn_scale", shape: [32]
     )
-    self.attentionProjectionWeight = try Self.require(
+    let attentionProjectionWeight = try Self.require(
       weights,
       name: "\(prefix).layer4.projection_weight",
       shape: [1024, 1024]
@@ -657,8 +652,31 @@ struct NeuralRenderingGlobalBlock {
     let attentionCosine = try Self.require(
       weights, name: "\(prefix).layer4.attn_cos_skip", shape: [1024]
     )
-    self.attentionCosine = attentionCosine
-    self.preciseAttention = preciseAttention
+    let body: (MLXArray) -> MLXArray = { input in
+      NeuralRenderingTransformerOperations.e4m3RoundTrip(
+        NeuralRenderingTransformerOperations.globalBlock(
+          input,
+          expansionWeight: expansionWeight,
+          feedForwardProjectionWeight: feedForwardProjectionWeight,
+          feedForwardCosine: feedForwardCosine,
+          qkvWeight: qkvWeight,
+          attentionScale: attentionScale,
+          attentionBias: nil,
+          attentionProjectionWeight: attentionProjectionWeight,
+          attentionCosine: attentionCosine,
+          headCount: 32,
+          logitCap: Self.experimentalLogitCap,
+          preciseSoftmax: preciseAttention,
+          fusedOperations: fusedOperations
+        )
+      )
+    }
+    self.body = body
+    if compileGraph && fusedOperations {
+      self.compiledBody = compile { (input: MLXArray) -> MLXArray in body(input) }
+    } else {
+      self.compiledBody = nil
+    }
   }
 
   /// Global attention logit cap; `MLXDLSS_EXPERIMENTAL_GLOBAL_LOGIT_CAP` overrides
@@ -675,22 +693,10 @@ struct NeuralRenderingGlobalBlock {
   }()
 
   func callAsFunction(_ input: MLXArray) -> MLXArray {
-    return NeuralRenderingTransformerOperations.e4m3RoundTrip(
-      NeuralRenderingTransformerOperations.globalBlock(
-        input,
-        expansionWeight: expansionWeight,
-        feedForwardProjectionWeight: feedForwardProjectionWeight,
-        feedForwardCosine: feedForwardCosine,
-        qkvWeight: qkvWeight,
-        attentionScale: attentionScale,
-        attentionBias: nil,
-        attentionProjectionWeight: attentionProjectionWeight,
-        attentionCosine: attentionCosine,
-        headCount: 32,
-        logitCap: Self.experimentalLogitCap,
-        preciseSoftmax: preciseAttention
-      )
-    )
+    if let compiledBody, input.shape[1] * input.shape[2] <= 512 {
+      return compiledBody(input)
+    }
+    return body(input)
   }
 
   private static func require(
@@ -716,14 +722,18 @@ struct NeuralRenderingGlobalStage {
   init(
     weights: ValidatedWeights,
     quantizeFFN: Bool = false,
-    preciseAttention: Bool = true
+    preciseAttention: Bool = true,
+    fusedOperations: Bool = false,
+    compileGraph: Bool = false
   ) throws {
     self.blocks = try (31...38).map { index in
       try NeuralRenderingGlobalBlock(
         weights: weights,
         blockIndex: index,
         quantizeFFN: quantizeFFN,
-        preciseAttention: preciseAttention
+        preciseAttention: preciseAttention,
+        fusedOperations: fusedOperations,
+        compileGraph: compileGraph
       )
     }
   }
@@ -774,7 +784,9 @@ struct NeuralRenderingTrunk {
     self.globalStage = try NeuralRenderingGlobalStage(
       weights: weights,
       quantizeFFN: quantizeGlobalFFN,
-      preciseAttention: true
+      preciseAttention: true,
+      fusedOperations: compileBlocks,
+      compileGraph: compileBlocks && ProcessInfo.processInfo.environment["MLXDLSS_COMPILE_GLOBAL"] != "0"
     )
   }
 
@@ -1952,7 +1964,8 @@ enum NeuralRenderingTransformerOperations {
     headCount: Int,
     logitCap: Float? = nil,
     symmetricLogitCap: Bool = false,
-    preciseSoftmax: Bool = true
+    preciseSoftmax: Bool = true,
+    streamedGlobalAttention: Bool = false
   ) -> MLXArray {
     precondition(input.ndim == 3)
     precondition(headCount > 0)
@@ -1986,6 +1999,16 @@ enum NeuralRenderingTransformerOperations {
       ? vendorCosinePublish(key)
       : e4m3RoundTrip(frameworkCosineNormalize(key))
     let publishedValue = e4m3RoundTrip(value)
+    if streamedGlobalAttention, preciseSoftmax, attentionBias == nil,
+      symmetricLogitCap, logitCap == 3, headChannels == 32,
+      normalizedQuery.dtype == .float16, tokenCount.isMultiple(of: 2),
+      NeuralRenderingStreamedGlobalAttention.isEnabled(tokens: tokenCount)
+    {
+      let attended = NeuralRenderingStreamedGlobalAttention.apply(
+        query: normalizedQuery, key: normalizedKey, value: publishedValue)
+        .transposed(0, 2, 1, 3).reshaped([batchCount, tokenCount, channels])
+      return matmul(attended, projectionWeight)
+    }
     let rawScores = matmul(
       normalizedQuery,
       normalizedKey.transposed(0, 1, 3, 2)
@@ -2687,16 +2710,18 @@ enum NeuralRenderingTransformerOperations {
     attentionCosine: MLXArray,
     headCount: Int,
     logitCap: Float? = globalAttentionLogitCap,
-    preciseSoftmax: Bool = true
+    preciseSoftmax: Bool = true,
+    fusedOperations: Bool = false
   ) -> MLXArray {
     precondition(input.ndim == 4)
     let shape = input.shape
     let channels = shape[3]
     let tokens = input.reshaped([shape[0], shape[1] * shape[2], channels])
     // Launch 58 publishes the gated expansion as E4M3 (98.3% exact bytes).
-    let feedForwardBranch = feedForwardProjectionWeight(
-      e4m3RoundTrip(quadraticGateActivation(expansionWeight(tokens)))
-    )
+    let expanded = expansionWeight(tokens)
+    let published = fusedOperations && expanded.dtype == .float16
+      ? quadraticGatePublish(expanded) : e4m3RoundTrip(quadraticGateActivation(expanded))
+    let feedForwardBranch = feedForwardProjectionWeight(published)
     let feedForwardOutput = cosineResidual(
       skip: tokens,
       branch: feedForwardBranch,
@@ -2713,7 +2738,8 @@ enum NeuralRenderingTransformerOperations {
       headCount: headCount,
       logitCap: logitCap,
       symmetricLogitCap: true,
-      preciseSoftmax: preciseSoftmax
+      preciseSoftmax: preciseSoftmax,
+      streamedGlobalAttention: fusedOperations
     )
     return cosineResidual(
       skip: feedForwardOutput,

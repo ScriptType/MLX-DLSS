@@ -28,6 +28,10 @@ public actor MLXNeuralRenderingDeviceTemporalBackend: NeuralRenderBackend {
   private var noiseFrameIndex: UInt32 = 0
   private var extensionIndices: (geometry: NeuralRenderingNetworkGeometry, rows: MLXArray, columns: MLXArray)?
   private let videoOutput: MLXVideoOutput?
+  private var nativeComposition: MLXVideoComposition?
+  private var nativeCompositionOptions: MLXVideoOutputOptions?
+  private var nativeGuides: (width: Int, height: Int, motion: MLXArray, depth: MLXArray)?
+  private var nativeFrameInFlight = false
 
   /// - Parameter geometry: how logical frames map onto the network extent.
   ///   `vendorAligned` (default) pads every frame to the recovered minimum
@@ -93,6 +97,50 @@ public actor MLXNeuralRenderingDeviceTemporalBackend: NeuralRenderBackend {
     try videoOutput?.finish(to: output) ?? 0
   }
 
+  public func renderVideoFrame(
+    _ frame: MLXVideoFrame, motion: MLXVideoMotion?,
+    context: NeuralRenderFrameContext, processingScale: Float = 1, temporal: Bool = true,
+    outputOptions: MLXVideoOutputOptions? = nil,
+    featureControls: NeuralRenderingFeatureControls? = nil, intensity: Float? = nil
+  ) async throws -> MLXVideoFrame {
+    guard !nativeFrameInFlight else { throw MLXMediaError("Submit native NR frames sequentially") }
+    nativeFrameInFlight = true
+    defer { nativeFrameInFlight = false }
+    guard let options = outputOptions ?? videoOutput?.options,
+      frame.width == options.width, frame.height == options.height,
+      processingScale.isFinite, (1...4).contains(processingScale),
+      intensity.map({ $0.isFinite && (0...2).contains($0) }) ?? true
+    else { throw MLXMediaError("Native rendering requires matching video output dimensions and scale 1...4") }
+    if nativeCompositionOptions != options {
+      nativeComposition = MLXVideoComposition(options: options)
+      nativeCompositionOptions = options
+    }
+    let composition = nativeComposition!
+    let width = Int((Float(frame.width) * processingScale).rounded(.toNearestOrEven))
+    let height = Int((Float(frame.height) * processingScale).rounded(.toNearestOrEven))
+    let color = composition.resample(frame.array, width: width, height: height)
+    if nativeGuides?.width != width || nativeGuides?.height != height {
+      nativeGuides = (width, height, MLXArray.zeros([1, height, width, 2]),
+        MLXArray.ones([1, height, width, 1]))
+    }
+    if let motion, motion.vectors.shape != [1, frame.height, frame.width, 2] {
+      throw MLXMediaError("Motion dimensions do not match the source frame")
+    }
+    let vectors = motion.map { MLXVideoMotion.resize($0.vectors, width: width, height: height, nearest: false) }
+      ?? nativeGuides!.motion
+    let confidence = motion.map { MLXVideoMotion.resize($0.confidence, width: width, height: height, nearest: true) }
+    let frameContext = NeuralRenderFrameContext(streamID: context.streamID, frameIndex: context.frameIndex,
+      discontinuity: !temporal ? .explicit : motion?.reset == true ? .sceneCut : context.discontinuity)
+    let descriptors = try [("color", 3), ("motion", 2), ("depth", 1)].map { name, channels in
+      try TensorDescriptor(name: name, shape: [1, height, width, channels], dataType: .float32, layout: .nhwc)
+    }
+    let result = try await renderArrays(context: frameContext, color: color, motion: vectors,
+      depth: nativeGuides!.depth, controlMask: nil, historyConfidence: confidence,
+      descriptors: descriptors, evaluateOutput: false,
+      featureControls: featureControls, intensity: intensity)
+    return MLXVideoFrame(composition(result.output, source: frame.array))
+  }
+
   private func renderDevice(_ request: NeuralRenderRequest, evaluateOutput: Bool = true) async throws -> (output: MLXArray, nanoseconds: UInt64) {
     guard let context = request.temporalContext else {
       throw TemporalLifecycleError.missingFrameContext
@@ -135,7 +183,24 @@ public actor MLXNeuralRenderingDeviceTemporalBackend: NeuralRenderBackend {
       try validate(historyConfidence, name: "historyConfidence", channels: 1, expectedSpatialShape: spatialShape)
       try validateHistoryConfidenceValues(historyConfidence)
     }
-    let descriptors = [color.descriptor, motion.descriptor, depth.descriptor]
+    return try await renderArrays(
+      context: context, color: array(color), motion: array(motion), depth: array(depth),
+      controlMask: controlMask.map(array), historyConfidence: historyConfidence.map(array),
+      descriptors: [color.descriptor, motion.descriptor, depth.descriptor],
+      evaluateOutput: evaluateOutput
+    )
+  }
+
+  /// Native video uses the same lifecycle and model graph without a host tensor round trip.
+  func renderArrays(
+    context: NeuralRenderFrameContext, color colorArray: MLXArray, motion motionArray: MLXArray,
+    depth depthArray: MLXArray, controlMask controlMaskArray: MLXArray?,
+    historyConfidence confidenceArray: MLXArray?, descriptors: [TensorDescriptor],
+    evaluateOutput: Bool, featureControls: NeuralRenderingFeatureControls? = nil,
+    intensity: Float? = nil
+  ) async throws -> (output: MLXArray, nanoseconds: UInt64) {
+    let featureControls = featureControls ?? self.featureControls
+    let intensity = intensity ?? controlMaskIntensity
     if let resetRequest = try tracker.prepare(
       cadence: temporalCadence,
       context: context,
@@ -146,12 +211,9 @@ public actor MLXNeuralRenderingDeviceTemporalBackend: NeuralRenderBackend {
     }
 
     do {
-      let colorArray = array(color)
-      let controlMaskArray = controlMask.map(array)
-      let confidenceArray = historyConfidence.map(array)
       let started = ContinuousClock.now
-      let logicalHeight = color.descriptor.shape[1]
-      let logicalWidth = color.descriptor.shape[2]
+      let logicalHeight = colorArray.shape[1]
+      let logicalWidth = colorArray.shape[2]
       let geometry = try geometryPolicy.resolve(
         outputWidth: logicalWidth,
         outputHeight: logicalHeight
@@ -167,9 +229,9 @@ public actor MLXNeuralRenderingDeviceTemporalBackend: NeuralRenderBackend {
           noiseFrameIndex: noiseFrameIndex,
           history: history,
           historyTransform: historyTransform,
-          motion: array(motion),
+          motion: motionArray,
           motionTransform: motionTransform,
-          depth: array(depth),
+          depth: depthArray,
           depthInverted: depthInverted,
           depthGuideMode: .observedZeroDescriptor,
           historyConfidence: confidenceArray,
@@ -191,14 +253,14 @@ public actor MLXNeuralRenderingDeviceTemporalBackend: NeuralRenderBackend {
           )
         } else {
           let baseFeatureTensor = try NeuralRenderingFirstFramePreprocessor.makeFeatureTensor(
-            from: color,
+            from: try hostTensor(colorArray, shape: colorArray.shape),
             noiseFrameIndex: noiseFrameIndex,
             geometry: geometry,
             normalizedStyle: featureControls.normalizedStyle,
             localToneStrength: featureControls.localToneStrength,
             localStructureStrength: featureControls.localStructureStrength,
             automaticMask: featureControls.automaticMask,
-            controlMask: controlMask
+            controlMask: try controlMaskArray.map { try hostTensor($0, shape: $0.shape) }
           )
           networkBaseFeatures = array(baseFeatureTensor)
         }
@@ -211,9 +273,9 @@ public actor MLXNeuralRenderingDeviceTemporalBackend: NeuralRenderBackend {
             baseFeatures: logicalBaseFeatures,
             history: history,
             historyTransform: historyTransform,
-            motion: array(motion),
+            motion: motionArray,
             motionTransform: motionTransform,
-            depth: array(depth),
+            depth: depthArray,
             depthInverted: depthInverted,
             depthGuideMode: .observedZeroDescriptor,
             historyConfidence: confidenceArray,
@@ -247,7 +309,7 @@ public actor MLXNeuralRenderingDeviceTemporalBackend: NeuralRenderBackend {
         hasHistory: history != nil,
         historyConfidence: confidenceArray,
         controlMask: controlMaskArray,
-        intensity: controlMaskIntensity
+        intensity: intensity
       )
       if evaluateOutput { eval(output) }
       let executionNanoseconds = nanoseconds(
@@ -431,7 +493,7 @@ final class MLXTemporalPostprocessor: @unchecked Sendable {
   private let alphaLookup: MLXArray
   private let kernel = MLXFast.metalKernel(
     name: "mlxdlss_temporal_postprocess",
-    inputNames: ["head", "currentColor", "features", "alphaLookup", "controlMask", "historyConfidence"],
+    inputNames: ["head", "currentColor", "features", "alphaLookup", "controlMask", "historyConfidence", "params"],
     outputNames: ["output"],
     source: #"""
       uint pixel = thread_position_in_grid.x;
@@ -463,9 +525,8 @@ final class MLXTemporalPostprocessor: @unchecked Sendable {
           temporal = predicted + alpha * (history - predicted);
         }
         if (hasEffectBlend) {
-          float intensity = as_type<float>(uint(intensityBits));
           float red = hasControlMask ? controlMask[colorOffset] : 1.0f;
-          float blend = clamp(red * intensity, 0.0f, 1.0f);
+          float blend = clamp(red * as_type<float>(params[0]), 0.0f, 1.0f);
           float current = currentColor[colorOffset + channel];
           output[colorOffset + channel] = clamp(
             current + blend * (temporal - current),
@@ -505,13 +566,13 @@ final class MLXTemporalPostprocessor: @unchecked Sendable {
     intensity: Float = 1
   ) -> MLXArray {
     kernel(
-      [head, currentColor, features, alphaLookup, controlMask ?? currentColor, historyConfidence ?? currentColor],
+      [head, currentColor, features, alphaLookup, controlMask ?? currentColor, historyConfidence ?? currentColor,
+       NeuralRenderingKernelParameters.array([intensity.bitPattern, 0, 0, 0, 0, 0, 0, 0])],
       template: [
         ("hasHistory", hasHistory),
         ("hasHistoryConfidence", historyConfidence != nil),
         ("hasEffectBlend", controlMask != nil || intensity != 1),
         ("hasControlMask", controlMask != nil),
-        ("intensityBits", Int(intensity.bitPattern)),
       ],
       grid: (currentColor.shape[1] * currentColor.shape[2], 1, 1),
       threadGroup: (256, 1, 1),

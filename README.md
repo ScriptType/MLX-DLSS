@@ -39,9 +39,10 @@ Frame generation: even frames in, generated frames out, the withheld frames for 
 
 ## Requirements
 
-- Python 3.10+ (macOS, Linux, Windows); PyTorch is installed as a dependency.
-- Video: `ffmpeg` and `ffprobe` in `PATH`; optical-flow temporal mode: `pip install './python[video]'`.
-- Metal backend: macOS 14+, Xcode with Swift 6.2, CMake, Ninja.
+- Native macOS app and video CLI: Apple Silicon, macOS 26+, Xcode with Swift 6.2+, CMake and Ninja. No Python, FFmpeg or web server is bundled or required at runtime.
+- Metal tensor/image library: macOS 14+ with the same build tools.
+- Optional Python tools (weight extraction, PyTorch and web UI): Python 3.10+; PyTorch is installed as a dependency.
+- Python video adapter: `ffmpeg` and `ffprobe` in `PATH`; optical flow: `pip install './python[video]'`.
 - Core ML packages: `pip install './python[coreml]'` (macOS or Linux).
 - Web front end: `pip install './python[web]'`.
 
@@ -61,6 +62,27 @@ releases; there is one supported DLL build.
 
 ## Install and build
 
+Build and open the native SwiftUI app:
+
+```sh
+scripts/build-native-app.sh
+open '.build/MLX DLSS.app'
+```
+
+Choose your existing `NeuralRendering.dlssmodel` package and FG safetensors in
+the inspector, import media and start the queue. The app remembers weight and
+output folders. It includes the native CLI and Metal library; weights remain
+external. The weight-extraction commands above still use the optional Python
+tools during initial preparation.
+
+The **Live** view renders the selected image or video frame whenever rendering
+settings change. Videos start at the first frame; use the timeline or frame
+buttons to choose another. Rapid changes coalesce into the latest request and
+reuse loaded weights. Temporal preview warms up to three preceding frames;
+export uses the complete sequence. Frame generation runs during export.
+
+For the Python/web workflow and a standalone Metal CLI:
+
 ```sh
 python -m pip install './python[web,video]'
 swift build -c release && scripts/prepare-mlx-metallib.sh "$(swift build -c release --show-bin-path)"   # macOS, Metal backend
@@ -72,6 +94,26 @@ PyTorch runs the same graph on any machine; Core ML is an export with a fixed
 extent.
 
 ## Commands
+
+Native image and video processing (no Python or FFmpeg):
+
+```sh
+.build/release/mlxdlss process-image in.png --output out.png --model weights/NeuralRendering.dlssmodel --detail-strength 2
+.build/release/mlxdlss process-video in.mp4 --output out.mp4 --model weights/NeuralRendering.dlssmodel --detail-strength 2
+.build/release/mlxdlss process-video in.mp4 --output out.mp4 --model weights/NeuralRendering.dlssmodel --framegen-weights weights/framegen.safetensors --factor 2 --order nr-fg
+```
+
+Native video defaults to temporal rendering, VideoToolbox optical flow (Vision
+fallback), hardware H.264 and audio. `--temporal off` disables history;
+`--motion vision|videotoolbox|zero` selects motion explicitly. Other options:
+`--scene-cut-threshold 0.3`, `--start-frame N`, `--frames N`, `--codec hevc|prores`
+(ProRes needs MOV), `--bitrate BPS`, `--audio off`, `--order fg-nr`,
+`--slow-motion on`. Slow motion preserves audio pitch. Original timestamps and
+variable frame intervals are retained; FG writes `(N-1)×factor+1` frames.
+JSON output includes stage timings, with progress on stderr. Existing output
+files are preserved. Native video currently produces SDR 8-bit sRGB frames;
+PNG/TIFF still exports retain 16-bit output. The Python adapter remains available
+for custom FFmpeg filters, codec arguments and RGB16 video workflows.
 
 Still images:
 
@@ -236,6 +278,48 @@ See [NR → FG measurements](docs/frame-generation.md#gpu-video-chain) for the
 combined path and its numerical comparison.
 NR's fused blocks require float16; `--precision float32` keeps the reference
 MLX graph even when `--execution metal-fused` is selected.
+
+The native path uses AVFoundation/VideoToolbox and IOSurface-backed Metal
+buffers for decoding, motion and encoding. Both NR → FG and FG → NR retain
+float32 RGB between effects. In four alternating full runs of the same 228-frame
+512×384 clip with detail 2, the new native global-attention/graph path took
+**11.33–12.36 s (18.4–20.1 input fps)** versus 11.77–13.43 s with both disabled:
+about 4–9% higher throughput in the two pairs. All four decoded RGB streams
+had the same SHA-256. These include startup, motion, decode and encode and ran
+with an empty executable search path. The new runs spent 0.37–0.48 s decoding
+and encoding, 3.19–3.32 s on motion and 7.06–7.73 s on NR; peak process footprint
+was 1.54–1.81 GB. Desktop load still varies, so these do not establish an exact
+multiplier against historical runs from previous days.
+
+On real weights, the new global-block path retains the vendor's half-precision
+denominator, E4M3 publication and full spatial context. Short global sequences
+use on-chip attention tiles and cached MLX graphs; larger sequences keep the
+materialized path selected by the M2 Max measurements. Eight global blocks took
+3.79 ms versus 4.85–5.51 ms at 48 tokens, and 21.59 ms versus 24.26–24.92 ms at
+510 tokens, before graph caching; tested outputs matched exactly. Set
+`MLXDLSS_STREAMED_GLOBAL_ATTENTION=0` or `MLXDLSS_COMPILE_GLOBAL=0` for comparisons.
+Forcing streamed attention with `=1` above 512 tokens saves quadratic temporary
+storage but was slower on M2 Max. [FG fusion measurements](docs/frame-generation.md#native-output-head-fusion)
+cover the additional 18–22% warm FG throughput gain.
+
+Experimental results on this M2 Max, kept out of the default path:
+
+- Lossless FP8 weight packing matched the reference, but a tiled decode/GEMM
+  prototype took 0.54–2.90 ms versus 0.25–0.84 ms for MLX half GEMMs. Packing
+  single-head window intermediates halved their storage but gave no throughput
+  win: three blocks at 1088×1920 took 50.97 ms versus 50.46–50.61 ms.
+- Direct [ANEForge](https://github.com/sbryngelson/ANEForge) dispatch of the real
+  1024→4096 projection took 0.30/0.51/1.04 ms for 48/192/768 tokens, excluding
+  copies, versus roughly 0.27/0.35/0.73 ms on Metal. Maximum half-output error
+  was 0.001. Core ML's compute plan selected ANE at 192 tokens, but its Python
+  prediction boundary took 1.05 ms; at 48 tokens it selected CPU. These are layer
+  probes, not timings or validation of the whole network on ANE.
+- Reusing the global latent every other frame on 16 frames of the comparison
+  clip introduced 0.0037–0.0072 mean RGB error (maximum 0.064). A linear latent
+  correction did not fix it. This optimistic probe shared fresh encoder inputs
+  and evaluated independent-frame rendering; a trained compact correction model
+  would need a separate representative training/validation corpus and temporal
+  quality gate. No learned replacement or stale feature cache is enabled.
 
 Not included: DLSS Super Resolution (measured, loses to Lanczos on realistic
 content without engine motion vectors and jitter; see the note below) and the

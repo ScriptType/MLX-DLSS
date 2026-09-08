@@ -23,7 +23,9 @@ if [[ ! -f "$MLX_SOURCE/CMakeLists.txt" ]]; then
   exit 66
 fi
 
-swift build --package-path "$PROJECT_ROOT" --build-tests --jobs "$BUILD_JOBS"
+if [[ "${MLXDLSS_PREPARE_SKIP_SWIFT_BUILD:-0}" != "1" ]]; then
+  swift build --package-path "$PROJECT_ROOT" --build-tests --jobs "$BUILD_JOBS"
+fi
 
 cmake \
   -S "$MLX_SOURCE" \

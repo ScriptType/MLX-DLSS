@@ -183,6 +183,30 @@ GPU-display/FG processes exactly, covering both model precisions, empty and
 single-frame input, scene resets, multi-phase batches, short EOF windows,
 RGB8/RGB16 output, audio/rate preservation and cancellation.
 
+## Native output-head fusion
+
+The linear output head now fetches its bilinearly enlarged input inside the
+convolution. It preserves the intermediate half rounding and removes the
+upsample allocation/dispatch in both synthesis blocks. Float32 inference keeps
+its reference path. `MLXDLSS_FG_FUSED_UPSAMPLE=0` restores separate operations.
+
+Paired release measurements on M2 Max, real weights, fixed nonconstant inputs,
+four warm-ups and median of 20 batches, before/after/before. These measure the
+complete warm FG graph (synthesis and composition), excluding I/O and startup;
+they must not be compared directly with pipe or encoded-video timings.
+
+| extent | generated frames per batch | separate upsample | fused output head |
+| --- | --- | --- | --- |
+| 960×540 | 1 | 4.44–4.46 ms | 3.77 ms |
+| 960×540 | 4 | 14.44–14.50 ms | 12.25 ms |
+| 1920×1080 | 1 | 14.26–14.41 ms | 12.10 ms |
+| 1920×1080 | 4 | 51.50–51.94 ms | 42.45 ms |
+
+All four complete float32 RGB outputs matched exactly. Kernel checks also
+cover strided batches, odd extents and single-pixel edges. The native media
+processor uses the same generator, with AVFoundation decode/encode and
+float32 Metal RGB between NR and FG in either order.
+
 ## Not ported
 
 The motion-vector and depth inputs, the HUD-less/UI compositing and the

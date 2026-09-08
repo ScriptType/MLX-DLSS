@@ -211,7 +211,9 @@ public final class FrameGenerator {
       }
       let heads = FrameGenerationFusedConv.apply(Self.upsample2(x), fusedHeads, activation: true)
       lap("heads", heads)
-      let out = FrameGenerationFusedConv.apply(Self.upsample2(heads), fusedOut, activation: false)
+      let fuseUpsample = FrameGenerationFusedConv.fusedUpsampleEnabled
+      let out = FrameGenerationFusedConv.apply(fuseUpsample ? heads : Self.upsample2(heads), fusedOut,
+        activation: false, upsample: fuseUpsample)
       lap("out", out)
       return (out[0..., 0..., 0..., 0..<4], out[0..., 0..., 0..., 4..<5], out[0..., 0..., 0..., 5..<8])
     }

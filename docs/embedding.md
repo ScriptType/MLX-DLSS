@@ -120,6 +120,40 @@ The package is compiled for one network extent: a `256×256` frame needs a
 graph at conversion time, so rebuild it with `mlxdlss-weights coreml` whenever the
 recovered graph changes; the MLX path applies such fixes at load time.
 
+## Native media and live preview
+
+On macOS 26+, `DLSSMedia` owns AVFoundation decode/encode, VideoToolbox or Vision
+motion, temporal NR and FG. It requires no Python process or raw-frame pipe:
+
+```swift
+import DLSSMedia
+
+var options = MediaProcessingOptions(renderingModel: modelPackageURL,
+                                     frameGenerationWeights: frameGenerationWeightsURL)
+options.detailStrength = 2
+let processor = NativeMediaProcessor()
+let result = try await processor.processVideo(input: inputURL, output: outputURL,
+                                              options: options) { progress in
+  // Update UI on its actor; keep this callback short.
+  print(progress.inputFrames, progress.outputFrames)
+}
+```
+
+For images, omit FG weights and call `processImage`. For a custom frame loop,
+`MLXVideoFrame` imports IOSurface-backed pixel buffers and
+`MLXPixelBufferWriter` exports them; `renderVideoFrame` retains temporal history
+and applies display settings without a host float32 copy. Submit one frame at
+a time per renderer. Cancellation prevents publication of a partial output;
+existing files are never replaced.
+
+`NativeMediaPreview.render(MediaPreviewRequest(input:isVideo:time:options:))`
+returns original/processed `CGImage`s, the actual selected timestamp and timing.
+Retain one preview actor to reuse weights and decoded frames. Submit requests
+sequentially, coalesce changes and discard superseded responses, as the native
+app does. Video preview uses up to three preceding frames and a fresh temporal
+history per request; FG is reserved for export. Preview and export should share
+one scheduling lane so they do not compete for the GPU.
+
 ## Performance expectations
 
 Use the [paired measurements in the README](../README.md#accuracy-and-speed)

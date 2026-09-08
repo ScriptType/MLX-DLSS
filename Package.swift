@@ -10,7 +10,9 @@ let package = Package(
     .library(name: "DLSSCore", targets: ["DLSSCore"]),
     .library(name: "DLSSCoreML", targets: ["DLSSCoreML"]),
     .library(name: "DLSSMLX", targets: ["DLSSMLX"]),
+    .library(name: "DLSSMedia", targets: ["DLSSMedia"]),
     .executable(name: "mlxdlss", targets: ["mlxdlss"]),
+    .executable(name: "MLXDLSSApp", targets: ["MLXDLSSApp"]),
   ],
   dependencies: [
     .package(
@@ -37,6 +39,16 @@ let package = Package(
         "DLSSCore",
         .product(name: "MLX", package: "mlx-swift"),
         .product(name: "MLXNN", package: "mlx-swift"),
+      ],
+      linkerSettings: [.linkedFramework("CoreVideo"), .linkedFramework("Metal"), .linkedFramework("IOSurface")]
+    ),
+    .target(
+      name: "DLSSMedia",
+      dependencies: ["DLSSCore", "DLSSMLX"],
+      linkerSettings: [
+        .linkedFramework("AVFoundation"), .linkedFramework("VideoToolbox"),
+        .linkedFramework("CoreImage"), .linkedFramework("ImageIO"),
+        .linkedFramework("Vision"),
       ]
     ),
     .executableTarget(
@@ -45,6 +57,7 @@ let package = Package(
         "DLSSCore",
         "DLSSCoreML",
         "DLSSMLX",
+        "DLSSMedia",
       ],
       linkerSettings: [
         .linkedFramework("CoreGraphics"),
@@ -54,6 +67,11 @@ let package = Package(
     .testTarget(
       name: "DLSSCoreTests",
       dependencies: ["DLSSCore"]
+    ),
+    .executableTarget(
+      name: "MLXDLSSApp",
+      dependencies: ["DLSSCore", "DLSSMLX", "DLSSMedia"],
+      linkerSettings: [.linkedFramework("SwiftUI"), .linkedFramework("AVKit")]
     ),
     .testTarget(
       name: "DLSSCoreMLTests",
@@ -69,6 +87,10 @@ let package = Package(
         "DLSSMLX",
         .product(name: "MLX", package: "mlx-swift"),
       ]
+    ),
+    .testTarget(
+      name: "DLSSMediaTests",
+      dependencies: ["DLSSMedia", "DLSSMLX"]
     ),
     .testTarget(
       name: "MLXDLSSCLITests",

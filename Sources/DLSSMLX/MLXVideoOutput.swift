@@ -3,7 +3,7 @@ import DLSSCore
 import MLX
 
 /// Display composition is separate from the full-resolution temporal history.
-public struct MLXVideoOutputOptions: Sendable {
+public struct MLXVideoOutputOptions: Equatable, Sendable {
   public enum Format: String, Sendable { case f32, u8, u16 }
   public let width: Int
   public let height: Int
