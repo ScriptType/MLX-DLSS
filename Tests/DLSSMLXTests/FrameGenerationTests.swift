@@ -347,6 +347,29 @@ final class FrameGenerationBatchTests: XCTestCase {
 
   private func maxDiff(_ a: MLXArray, _ b: MLXArray) -> Float { abs(a.asType(.float32) - b.asType(.float32)).max().item(Float.self) }
 
+  func testRGB8InterpolationMatchesFloatQuantization() throws {
+    for precision in [FrameGenerator.Precision.float16, .float32] {
+      let generator = try FrameGenerator(weights: synthetic(), precision: precision)
+      for (n, h, w) in [(1, 2, 3), (1, 17, 21), (3, 17, 21)] {
+        // Strided frames, broadcast phases, odd edges and values requiring output clamping.
+        let a = (random([n, w, h, 3], seed: 31) * 3 - 1).transposed(0, 2, 1, 3)
+        let b = (random([n, w, h, 3], seed: 32) * 3 - 1).transposed(0, 2, 1, 3)
+        let phases: [Float] = [0.25, 0.5, 0.75]
+        let floats = try generator.interpolate(a, b, phases: phases)
+        let bytes = try generator.interpolateRGB8(a, b, phases: phases)
+        XCTAssertEqual(floats.dtype, .float32)
+        XCTAssertEqual(bytes.dtype, .uint8)
+        XCTAssertEqual(bytes.shape, [3, h, w, 3])
+        XCTAssertEqual(bytes.asArray(UInt8.self), (floats * 255 + 0.5).asType(.uint8).asArray(UInt8.self))
+      }
+      let a = random([1, 16, 16, 3], seed: 33)
+      XCTAssertThrowsError(try generator.interpolateRGB8(a, a, phases: []))
+      XCTAssertThrowsError(try generator.interpolateRGB8(a, a[0..., 0..<8, 0..., 0...], phases: [0.5]))
+      let batch = broadcast(a, to: [2, 16, 16, 3])
+      XCTAssertThrowsError(try generator.interpolateRGB8(batch, batch, phases: [0.5]))
+    }
+  }
+
   /// A batch of phases equals the per-phase results, on the fused and the MLX convolution paths.
   func testBatchedPhasesMatchSingleCalls() throws {
     let a = random([1, 40, 64, 3], seed: 7), b = random([1, 40, 64, 3], seed: 8)

@@ -15,19 +15,19 @@ enum FrameGenerationFusedConv {
     inputNames: ["input", "weight", "bias", "residual", "params"],
     outputNames: ["out"],
     source: #"""
-      // params = [height, width, cin, cout, flags, outHeight, outWidth, batch]
+      // params = [height, width, outHeight, outWidth, batch]; channels and epilogue are specialized.
       //   flags bit 0: activation (leaky 0.01, clamp ±6), bit 1: add residual, bit 2: 2x2 mean pool.
       // One thread per (sample, output pixel, group of 8 output channels).
       // weight layout: [tap 9][cin/4][cout] half4  (4 input channels per half4).
       const uint index = thread_position_in_grid.x;
       const int height = int(params[0]);
       const int width = int(params[1]);
-      const int cin = int(params[2]);
-      const int cout = int(params[3]);
-      const uint flags = params[4];
-      const int outHeight = int(params[5]);
-      const int outWidth = int(params[6]);
-      const uint batch = params[7];
+      const int cin = inputChannels;
+      const int cout = outputChannels;
+      const uint flags = epilogueFlags;
+      const int outHeight = int(params[2]);
+      const int outWidth = int(params[3]);
+      const uint batch = params[4];
       const int groups = cout / 8;
       const uint total = uint(outHeight * outWidth * groups) * batch;
       if (index >= total) { return; }
@@ -90,13 +90,13 @@ enum FrameGenerationFusedConv {
     inputNames: ["input", "weight", "bias", "residual", "params"],
     outputNames: ["out"],
     source: #"""
-      // params = [height, width, cin, cout, flags, batch]; weight layout [tap*cin + ci][cout] halves.
+      // params = [height, width, batch]; weight layout [tap*cin + ci][cout] halves.
       const int height = int(params[0]);
       const int width = int(params[1]);
-      const int cin = int(params[2]);
-      const int cout = int(params[3]);
-      const uint flags = params[4];
-      const int batch = int(params[5]);
+      const int cin = inputChannels;
+      const int cout = outputChannels;
+      const uint flags = epilogueFlags;
+      const int batch = int(params[2]);
       const int paddedWidth = ((width + 15) / 16) * 16 + 2;
       const uint simdgroupsPerTile = uint(cout / 16);
       const uint sg = simdgroup_index_in_threadgroup;
@@ -222,12 +222,13 @@ enum FrameGenerationFusedConv {
     let paddedInput = padded(x.asType(.float16), widths: [[0, 0], [1, 2], [1, 1 + tail], [0, 0]])
     var flags: UInt32 = activation ? 1 : 0
     if residual != nil { flags |= 2 }
-    let params = MLXArray([UInt32(h), UInt32(w), UInt32(layer.cin), UInt32(layer.cout), flags, UInt32(n)])
+    let params = MLXArray([UInt32(h), UInt32(w), UInt32(n)])
     let tiles = ((w + 15) / 16) * h * n
     let group = 32 * (layer.cout / 16)
     let res = residual ?? layer.bias
     return simdKernel(
       [contiguous(paddedInput), layer.rows, layer.bias, contiguous(res.asType(.float16)), params],
+      template: [("inputChannels", layer.cin), ("outputChannels", layer.cout), ("epilogueFlags", Int(flags))],
       grid: (tiles * group, 1, 1),
       threadGroup: (group, 1, 1),
       outputShapes: [[n, h, w, layer.cout]],
@@ -250,11 +251,12 @@ enum FrameGenerationFusedConv {
     var flags: UInt32 = activation ? 1 : 0
     if residual != nil { flags |= 2 }
     if pool { flags |= 4 }
-    let params = MLXArray([UInt32(h), UInt32(w), UInt32(layer.cin), UInt32(layer.cout), flags, UInt32(outH), UInt32(outW), UInt32(n)])
+    let params = MLXArray([UInt32(h), UInt32(w), UInt32(outH), UInt32(outW), UInt32(n)])
     let count = n * outH * outW * (layer.cout / 8)
     let res = residual ?? layer.bias   // any array when unused; never read
     return kernel(
       [contiguous(x.asType(.float16)), layer.packed, layer.bias, contiguous(res.asType(.float16)), params],
+      template: [("inputChannels", layer.cin), ("outputChannels", layer.cout), ("epilogueFlags", Int(flags))],
       grid: (count, 1, 1),
       threadGroup: (min(count, 256), 1, 1),
       outputShapes: [[n, outH, outW, layer.cout]],

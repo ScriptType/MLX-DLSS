@@ -77,12 +77,13 @@ enum FrameGenStreamCommand {
       let pairs = window.count - 1
       let a = concatenated(window.dropLast().flatMap { f in Array(repeating: f, count: phases.count) }, axis: 0)
       let b = concatenated(window.dropFirst().flatMap { f in Array(repeating: f, count: phases.count) }, axis: 0)
-      let out = try generator.interpolate(a, b, phases: (0..<pairs).flatMap { _ in phases })   // [pairs * (factor - 1), H, W, 3]
-      if bytesPerValue == 1 {
-        let bytes = (out * 255 + 0.5).asType(.uint8)   // out is clamped to [0, 1] by the compose kernel
-        output.write(bytes.asData(access: .copy).data)
-      } else {
-        output.write(out.asData(access: .copy).data)
+      let batchPhases = (0..<pairs).flatMap { _ in phases }
+      let out = try bytesPerValue == 1
+        ? generator.interpolateRGB8(a, b, phases: batchPhases)
+        : generator.interpolate(a, b, phases: batchPhases)   // [pairs * (factor - 1), H, W, 3]
+      // The synchronous write finishes before the borrowed MLX storage can be released.
+      withExtendedLifetime(out) {
+        output.write(out.asData(access: .noCopyIfContiguous).data)
       }
       generated += pairs * phases.count
       window = [window[window.count - 1]]

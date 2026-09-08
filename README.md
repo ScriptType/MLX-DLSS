@@ -202,11 +202,15 @@ middle = generator.generate(frame_a_uint8, frame_b_uint8, factor=2)[0]   # facto
 | Neural rendering, Core ML | `0.008–0.014` MAE against the DLL |
 | Temporal path | Swift and Python agree within `0.0014` MAE per frame; against NVIDIA on a 64-frame static sequence: `0.0054` MAE (`42.3` dB) with the same drift from frame 0 as the vendor; motion, jitter and mask cases not captured |
 | Frame generation | reproduces the library's output at `59.9` dB PSNR (max 3/255) on captured frames; five whole clips within `0.01–0.03` dB of the library (27.4–38.9 dB against withheld frames) |
-| Frame generation, speed (M2 Max, 960×540 / 1920×1080) | Metal float16 auto dispatch: `5.30 / 16.58` ms per generated frame on the GPU at batch 1, `4.12 / 15.17` ms at batch 4, factor 2; startup and I/O excluded. [Batch and dispatch measurements](docs/frame-generation.md#speed) |
+| Frame generation, stream (M2 Max, 960×540 / 1920×1080) | Metal float16, factor 2: `6.00–6.73 / 21.15–21.52` ms per generated frame at batch 1, `4.94–5.02 / 19.35–20.45` ms at batch 4, including RGB8 pipe I/O, excluding startup. [Paired measurements](docs/frame-generation.md#speed) |
 | Temporal video, Metal (M2 Max) | a 228-frame 512×384, 60 fps clip with detail strength 2: `10.1–16.1 s`, versus `18.4–22.8 s` before these optimizations, including startup, optical flow, decode and encode |
 
-These are local timing ranges with other desktop GPU applications running;
-the final alternating before/after runs improved whole-clip time by about
+These are local timing ranges with other desktop GPU applications running.
+FG specializes Metal convolutions by channel count and epilogue, finishes
+RGB8 quantization before synchronizing with the CPU, and writes the shared MLX
+buffer directly to the pipe. The tested RGB8 and float32 outputs were byte-identical
+to the previous implementation. Temporal video's alternating before/after
+runs improved whole-clip time by about
 `1.4×`. On 24-frame raw sequences at 512×384 (scales 1 and 2) and 1920×1080,
 NR output differed from the previous implementation by at most `1.2e-7`;
 prefetch on/off was bit-exact. Checkpoints, history and model precision are

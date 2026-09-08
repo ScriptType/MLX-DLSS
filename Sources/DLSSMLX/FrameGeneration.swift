@@ -660,6 +660,16 @@ public final class FrameGenerator {
   /// Interpolated frames `[N, H, W, 3]` in [0, 1]: sample i is the frame between `a[i]` and `b[i]` at `phases[i]`.
   /// `a` and `b` may hold one frame each (`[1, H, W, 3]`) for several phases.
   public func interpolate(_ a: MLXArray, _ b: MLXArray, phases: [Float]) throws -> MLXArray {
+    try interpolate(a, b, phases: phases, rgb8: false)
+  }
+
+  /// Interpolated RGB8 frames, rounded after composition, with one GPU evaluation through quantization.
+  /// Accepts the same normalized inputs and phase batches as `interpolate(_:_:phases:)`.
+  public func interpolateRGB8(_ a: MLXArray, _ b: MLXArray, phases: [Float]) throws -> MLXArray {
+    try interpolate(a, b, phases: phases, rgb8: true)
+  }
+
+  private func interpolate(_ a: MLXArray, _ b: MLXArray, phases: [Float], rgb8: Bool) throws -> MLXArray {
     try check(a, b)
     guard !phases.isEmpty else { throw Error(description: "at least one phase is needed") }
     var aa = a, bb = b
@@ -669,7 +679,8 @@ public final class FrameGenerator {
     }
     guard aa.dim(0) == phases.count else { throw Error(description: "\(phases.count) phases for \(aa.dim(0)) frame pairs") }
     let export = synthesize(aa, bb, phases: MLXArray(phases))
-    let out = Self.compose(aa.asType(.float32), bb.asType(.float32), coarse: export, sigmoidMask: true)
+    var out = Self.compose(aa.asType(.float32), bb.asType(.float32), coarse: export, sigmoidMask: true)
+    if rgb8 { out = (out * 255 + 0.5).asType(.uint8) }
     eval(out)
     return out
   }

@@ -62,8 +62,36 @@ the withheld frames, the vendor's library against this port (PyTorch, M2 Max):
 
 ## Speed
 
-Current float16 Metal dispatch, M2 Max, real weights and nonconstant synthetic
-RGB inputs. These paired warm measurements include synthesis and composition
+The float16 Metal kernels specialize channel counts and activation/residual/
+pooling flags at compilation. RGB8 streaming evaluates synthesis, composition
+and quantization together, then writes the shared MLX storage without a host
+copy; float32 streaming also borrows the output buffer through the synchronous
+write. The public float32 interpolation API keeps its existing behavior.
+
+Paired release measurements on M2 Max with real weights and consecutive video
+frames resized to each extent, comparing against `ce3ec3e`. Each value is a
+median over 40 batches after four warm-up batches. The current ranges come
+from runs before and after the baseline run, with other desktop applications
+active. These times include input preparation and both RGB8 pipe directions,
+but exclude model startup, video decoding and encoding. Times are for the
+**whole batch**, producing `pairs × (factor − 1)` generated frames.
+
+| extent | pairs | factor | before | current |
+| --- | --- | --- | --- | --- |
+| 960×540 | 1 | 2 | 7.16 ms | 6.00–6.73 ms |
+| 960×540 | 4 | 2 | 23.16 ms | 19.77–20.09 ms |
+| 1920×1080 | 1 | 2 | 22.75 ms | 21.15–21.52 ms |
+| 1920×1080 | 4 | 2 | 87.79 ms | 77.39–81.79 ms |
+| 1920×1080 | 1 | 4 | 58.62 ms | 50.15–55.22 ms |
+| 1920×1080 | 4 | 4 | 234.12 ms | 215.19–216.26 ms |
+
+The generated RGB8 and float32 bytes matched the baseline in all six
+configurations. Tests also cover both model precisions, strided inputs,
+broadcast phases, odd and tiny extents, and RGB8 rounding and clamping.
+
+The scalar/SIMD comparison used to select auto dispatch, before specialization,
+used real weights and nonconstant synthetic RGB inputs on M2 Max.
+These paired warm measurements include synthesis and composition
 but exclude process startup and I/O. Times below are for the **whole batch**;
 each batch produces `pairs × (factor − 1)` generated frames.
 
