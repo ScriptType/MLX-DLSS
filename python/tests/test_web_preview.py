@@ -19,6 +19,24 @@ from PIL import Image
 
 @unittest.skipUnless(importlib.util.find_spec("pydantic"), "Install the web extra")
 class NativeProcessTests(unittest.TestCase):
+    def test_reads_progress_while_child_keeps_writing(self):
+        from mlxdlss.web.native import run_media
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "result.mp4"
+            script = """import json, sys, time
+from pathlib import Path
+for frame in (1, 2):
+    print(f'{frame}/3 input frames, {frame * 2} output', file=sys.stderr, flush=True)
+    time.sleep(0.5)
+Path(sys.argv[2]).write_bytes(b'rendered')
+print(json.dumps({'output': sys.argv[2]}))
+"""
+            reports = []
+            run_media([sys.executable, "-c", script, "--output", str(target)],
+                      lambda *values: reports.append(values), lambda: False)
+            self.assertEqual({report[2] for report in reports}, {1, 2})
+            self.assertEqual(target.read_bytes(), b"rendered")
+
     def test_cancel_reaps_child_and_discards_private_partial_files(self):
         from mlxdlss.web.native import run_media
         from mlxdlss.web.runners import Cancelled

@@ -80,7 +80,11 @@ def _run(command, report, should_stop, environment) -> dict:
     """Drain progress without filling a pipe; cancellation also reaps the child."""
     from .runners import Cancelled
 
-    with tempfile.TemporaryFile() as errors:
+    # Separate handles let us reread progress without moving the child's write
+    # position. This also works on Windows, where os.pread is unavailable.
+    with tempfile.TemporaryDirectory(prefix="mlxdlss-progress-") as directory, \
+            (Path(directory) / "stderr").open("w+b") as errors, \
+            (Path(directory) / "stderr").open("rb") as progress:
         process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=errors, text=True, env=environment)
         try:
             while True:
@@ -90,7 +94,8 @@ def _run(command, report, should_stop, environment) -> dict:
                     stdout, _ = process.communicate(timeout=0.15)
                     break
                 except subprocess.TimeoutExpired:
-                    lines = os.pread(errors.fileno(), 1_000_000, 0).decode(errors="replace")
+                    progress.seek(0)
+                    lines = progress.read(1_000_000).decode(errors="replace")
                     matches = re.findall(r"(\d+)/(\d+) input frames, (\d+) output", lines)
                     if matches:
                         done, total, out = map(int, matches[-1])
