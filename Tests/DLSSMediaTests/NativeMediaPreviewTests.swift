@@ -67,6 +67,14 @@ final class NativeMediaPreviewTests: XCTestCase, @unchecked Sendable {
     let repeated = try await preview.render(request)
     XCTAssertEqual(bytes(repeated.processed), firstBytes)
     XCTAssertEqual(repeated.historyFrames, 0)
+    var invalidModel = request.options
+    invalidModel.renderingModel = directory.appendingPathComponent("missing.dlssmodel")
+    do {
+      _ = try await preview.render(.init(input: input, isVideo: false, options: invalidModel))
+      XCTFail("An invalid model selection must report an error")
+    } catch {}
+    let recovered = try await preview.render(request)
+    XCTAssertEqual(bytes(recovered.processed), firstBytes)
   }
 
   private func bytes(_ image: CGImage) -> [UInt8] {

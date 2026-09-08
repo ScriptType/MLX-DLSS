@@ -186,6 +186,13 @@ Web front end:
 mlxdlss-web        # http://127.0.0.1:8181; --port, --no-browser, --native (pywebview window), --root DIR
 ```
 
+The web UI remains available alongside the SwiftUI app. Its Metal backend uses
+the same rebuilt `mlxdlss` kernels, but video I/O and motion preparation still use
+Python, FFmpeg and OpenCV. Live settings previews with timeline frame selection
+are currently native-app features; the web UI shows completed-job comparisons.
+`mlxdlss-web --native` opens the web UI in a pywebview window and still requires
+Python; it is separate from the SwiftUI app built by `scripts/build-native-app.sh`.
+
 Pages: Image (before/after slider), Video (effect chain: neural rendering and
 frame generation in either order; the result plays in place, a side-by-side
 comparison with the original is one click away), Jobs (queue, progress,

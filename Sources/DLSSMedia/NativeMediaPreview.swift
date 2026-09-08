@@ -79,7 +79,7 @@ public actor NativeMediaPreview {
     var processed = original!
     var historyFrames = 0
     if let url = options.renderingModel {
-      if modelURL != url || precision != options.precision {
+      if renderer == nil || modelURL != url || precision != options.precision {
         renderer = nil
         renderer = try MLXNeuralRenderingDeviceTemporalBackend(packageURL: url,
           executionMode: .metalFused, computePrecision: options.precision)
