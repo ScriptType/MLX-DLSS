@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+from dataclasses import replace
+from weakref import WeakSet
 
 from .jobs import JobQueue, JobStore
 from .runners import JobRunner, ModelCache
@@ -18,12 +20,27 @@ class WebState:
         self.store = JobStore(self.settings.outputs)
         self.runner = runner or JobRunner(lambda: self.settings, self.cache)
         self.queue = JobQueue(self.store, self.runner)
+        self.previews = WeakSet()
 
     def update_settings(self, **changes) -> None:
-        for key, value in changes.items():
-            if hasattr(self.settings, key):
-                setattr(self.settings, key, value)
+        updated = replace(self.settings, **changes)
+        if updated.outputs != self.settings.outputs:
+            if any(job.state in {"queued", "running"} for job in self.store.list()):
+                raise ValueError("Finish or cancel queued jobs before changing the output folder")
+            store = JobStore(updated.outputs)
+            self.queue.close()
+            self.store = store
+            self.queue = JobQueue(self.store, self.runner)
+        self.settings = updated
         self.settings.save()
+
+    def close(self) -> None:
+        for job in self.store.list():
+            if job.state in {"queued", "running"}:
+                self.queue.cancel(job.id)
+        for preview in list(self.previews):
+            preview.close()
+        self.queue.close()
 
 
 STATE: WebState | None = None

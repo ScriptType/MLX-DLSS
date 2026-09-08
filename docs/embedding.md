@@ -154,6 +154,12 @@ app does. Video preview uses up to three preceding frames and a fresh temporal
 history per request; FG is reserved for export. Preview and export should share
 one scheduling lane so they do not compete for the GPU.
 
+`mlxdlss preview-stream` exposes that actor to the web UI on macOS 26+. Each
+JSON line contains `input`, `video`, `time` and an `options` array of CLI flags.
+Each response contains base64 PNGs (`original`, `processed`), dimensions,
+`time`, `duration`, `frameInterval`, `historyFrames` and `elapsedSeconds`.
+Errors return an `error` field; the process remains available for the next request.
+
 The native `process-video` command exposes these options in addition to the
 [rendering controls](../README.md#cli):
 

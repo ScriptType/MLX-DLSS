@@ -74,6 +74,9 @@ html, body { background: var(--bg) !important; color: var(--text); font-family: 
 .mlxdlss-drop { position: relative; border: 1.5px dashed var(--line-strong); border-radius: var(--r-md); background: var(--bg); min-height: 176px; display: flex; align-items: center; justify-content: center; text-align: center; cursor: pointer; transition: border-color .15s, background .15s; }
 .mlxdlss-drop:hover, .mlxdlss-drop:has(.q-uploader--dnd) { border-color: var(--accent); background: var(--accent-soft); }
 .mlxdlss-drop-inner { display: flex; flex-direction: column; align-items: center; gap: 6px; padding: 24px; pointer-events: none; }
+.mlxdlss-drop-compact { min-height: 64px; }
+.mlxdlss-drop-compact .mlxdlss-drop-inner { padding: 12px; }
+.mlxdlss-drop-compact .q-icon, .mlxdlss-drop-compact .mlxdlss-drop-hint { display: none; }
 .mlxdlss-drop-inner .q-icon { font-size: 30px; color: var(--accent); }
 .mlxdlss-drop-title { font-weight: 500; }
 .mlxdlss-drop-hint { color: var(--muted); font-size: 13px; }
@@ -166,6 +169,23 @@ html, body { background: var(--bg) !important; color: var(--text); font-family: 
 .mlxdlss-wipe .tag.left { left: 10px; } .mlxdlss-wipe .tag.right { right: 10px; }
 .mlxdlss-kv { display: flex; gap: 16px; flex-wrap: wrap; color: var(--muted); font-size: 13px; }
 .mlxdlss-kv b { color: var(--text); font-weight: 500; }
+
+/* Keep the frame visible while working through the video controls. */
+.mlxdlss-page, .mlxdlss-header-inner { max-width: 1360px; }
+.mlxdlss-grid { align-items: stretch; }
+.mlxdlss-live-card { position: sticky; top: 76px; }
+.mlxdlss-row:has(.mlxdlss-seg) { grid-template-columns: 1fr; }
+.mlxdlss-row:has(.mlxdlss-seg) .mlxdlss-row-control { grid-column: 1 / -1; }
+@media (max-width: 960px) { .mlxdlss-live-card { position: static; } }
+@media (max-width: 600px) {
+  .mlxdlss-header-inner { height: auto; padding: 8px 16px 0; }
+  .mlxdlss-header-inner > div:first-child { flex: 1; min-width: 0; }
+  .mlxdlss-brand { width: 100%; }
+  .mlxdlss-nav { margin-left: 0; height: 40px; }
+  .mlxdlss-nav a { padding: 0 8px; }
+  .mlxdlss-status { align-self: flex-start; }
+  .mlxdlss-status > :not(.q-btn) { display: none; }
+}
 """
 
 
@@ -198,7 +218,7 @@ def slider_row(label: str, *, value: float, minimum: float, maximum: float, step
     with ui.element("div").classes("mlxdlss-row"):
         ui.label(label).classes("mlxdlss-row-label")
         with ui.element("div").classes("mlxdlss-row-control mlxdlss-slider"):
-            slider = ui.slider(min=minimum, max=maximum, step=step, value=value).props("dense color=primary").classes("w-full")
+            slider = ui.slider(min=minimum, max=maximum, step=step, value=value).props(f'dense color=primary aria-label="{label}"').classes("w-full")
         readout = ui.label(f"{value:g}").classes("mlxdlss-row-value mlxdlss-mono")
     slider.on_value_change(lambda e: readout.set_text(f"{e.value:g}"))
     if hint:
@@ -253,8 +273,9 @@ def dropzone(*, accept: str, title: str, hint: str, on_upload: Callable[[events.
             ui.icon("add_photo_alternate" if accept.startswith("image") else "movie")
             ui.label(title).classes("mlxdlss-drop-title")
             ui.label(hint).classes("mlxdlss-drop-hint")
-        uploader = ui.upload(on_upload=on_upload, auto_upload=True, max_file_size=max_size).props(f"accept={accept} flat")
-        uploader.on("click", lambda _e: uploader.run_method("pickFiles"))
+        uploader = ui.upload(on_upload=on_upload, auto_upload=True, multiple=True, max_file_size=max_size).props(f"accept={accept} flat")
+        uploader.on("click", lambda _e: uploader.run_method("pickFiles"),
+                    js_handler="e => { if (e.target.tagName !== 'INPUT' && !e.target.closest('button')) emit(); }")
     return zone
 
 

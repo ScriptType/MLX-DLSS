@@ -54,13 +54,17 @@ def settings_page() -> None:
             with setting("Now", ""):
                 ui.label(f"mlxdlss {'available' if s.mlxdlss_available() else 'not found'} · neural rendering on {s.resolved_backend('nr')} · frame generation on {s.resolved_backend('fg')}").classes("mlxdlss-muted mlxdlss-small")
         with ds.card("Folders", tight=True):
+            output_directory = path_setting("Output folder", "Switches output location and job history. Existing files stay where they are.", str(s.outputs))
             with setting("Root", "Settings, uploads and job outputs."):
                 root = ui.input(value=s.root).props("outlined dense").classes("flex-1")
 
         def save() -> None:
-            state.update_settings(nr_weights=nr_weights.value.strip(), nr_model=nr_model.value.strip(), fg_weights=fg_weights.value.strip(),
-                                  backend=backend.value, device=device.value, precision=precision.value, mlxdlss_binary=mlxdlss_binary.value.strip(),
-                                  root=root.value.strip() or s.root)
+            try:
+                state.update_settings(nr_weights=nr_weights.value.strip(), nr_model=nr_model.value.strip(), fg_weights=fg_weights.value.strip(),
+                                      backend=backend.value, device=device.value, precision=precision.value, mlxdlss_binary=mlxdlss_binary.value.strip(),
+                                      root=root.value.strip() or s.root, output_directory=output_directory.value.strip())
+            except (ValueError, OSError) as error:
+                ui.notify(str(error), type="negative"); return
             for field, mark in marks:
                 text, cls = status(field.value); mark.set_text(text); mark.classes(replace=f"mlxdlss-small w-16 {cls}")
             ui.notify("Settings saved", type="positive")

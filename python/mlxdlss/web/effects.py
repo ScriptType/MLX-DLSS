@@ -16,11 +16,13 @@ class NeuralRender(BaseModel):
     kind: Literal["nr"] = "nr"
     profile: str = "standard"
     processing_scale: float = Field(1.0, ge=1.0, le=4.0)
-    detail_strength: float = Field(1.0, ge=0.0, le=4.0)
+    detail_strength: float = Field(1.0, ge=0.0, le=8.0)
     colour_strength: float = Field(1.0, ge=0.0, le=4.0)
-    detail_radius: float = Field(4.0, ge=1.0, le=16.0)
+    detail_radius: float = Field(4.0, ge=0.5, le=64.0)
     intensity: float = Field(1.0, ge=0.0, le=2.0)
     temporal: bool = False            # video only: reprojected history + learned blend
+    motion: Literal["automatic", "videotoolbox", "vision", "flow", "zero"] = "automatic"
+    scene_cut_threshold: float = Field(0.3, ge=0.0, le=1.0)
 
     def model_post_init(self, _context) -> None:
         if self.profile not in PROFILE_NAMES:
@@ -32,7 +34,7 @@ class FrameGen(BaseModel):
 
     kind: Literal["fg"] = "fg"
     mode: Literal["fps", "slowmo"] = "fps"
-    factor: Literal[2, 3, 4] = 2
+    factor: Literal[2, 3, 4, 8, 16] = 2
     audio: Literal["copy", "stretch", "none"] = "copy"
 
     def model_post_init(self, _context) -> None:
@@ -42,6 +44,13 @@ class FrameGen(BaseModel):
 
 Effect = Annotated[Union[NeuralRender, FrameGen], Field(discriminator="kind")]
 EffectList = TypeAdapter(list[Effect])
+
+
+class OutputOptions(BaseModel):
+    codec: Literal["h264", "hevc", "prores"] = "h264"
+    include_audio: bool = True
+    start_frame: int = Field(0, ge=0)
+    frame_limit: int | None = Field(None, gt=0)
 
 MediaKind = Literal["image", "video"]
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}
@@ -91,18 +100,20 @@ def describe_effects(*, mlxdlss_available: bool, fg_weights: bool, nr_weights: b
                 "fields": {
                     "profile": {"type": "choice", "choices": list(PROFILE_NAMES), "default": "standard"},
                     "processing_scale": {"type": "number", "min": 1.0, "max": 4.0, "default": 1.0},
-                    "detail_strength": {"type": "number", "min": 0.0, "max": 4.0, "default": 1.0},
+                    "detail_strength": {"type": "number", "min": 0.0, "max": 8.0, "default": 1.0},
                     "colour_strength": {"type": "number", "min": 0.0, "max": 4.0, "default": 1.0},
-                    "detail_radius": {"type": "number", "min": 1.0, "max": 16.0, "default": 4.0},
+                    "detail_radius": {"type": "number", "min": 0.5, "max": 64.0, "default": 4.0},
                     "intensity": {"type": "number", "min": 0.0, "max": 2.0, "default": 1.0},
                     "temporal": {"type": "bool", "default": True, "media": ["video"]},
+                    "motion": {"type": "choice", "choices": ["automatic", "videotoolbox", "vision", "flow", "zero"], "default": "automatic"},
+                    "scene_cut_threshold": {"type": "number", "min": 0.0, "max": 1.0, "default": 0.3},
                 },
             },
             {
                 "kind": "fg", "name": "Frame generation", "media": ["video"], "available": fg_weights,
                 "fields": {
                     "mode": {"type": "choice", "choices": ["fps", "slowmo"], "default": "fps"},
-                    "factor": {"type": "choice", "choices": [2, 3, 4], "default": 2},
+                    "factor": {"type": "choice", "choices": [2, 3, 4, 8, 16], "default": 2},
                     "audio": {"type": "choice", "choices": ["copy", "stretch", "none"], "default": "copy"},
                 },
             },

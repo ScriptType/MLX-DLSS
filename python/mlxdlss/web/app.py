@@ -31,14 +31,17 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
-        print("warning: ffmpeg/ffprobe not found in PATH; video jobs will fail until they are installed", file=sys.stderr)
+        print("warning: ffmpeg/ffprobe not found; portable video and side-by-side comparisons are unavailable", file=sys.stderr)
     try:
-        from nicegui import app, ui
+        from nicegui import app, run, ui
     except ImportError:
         print("error: the web front end needs `pip install 'mlxdlss[web]'` (nicegui, pydantic)", file=sys.stderr)
         return 2
     settings = Settings.load(args.root)
     state_module.STATE = state_module.WebState(settings)
+    async def shutdown():
+        await run.io_bound(state_module.STATE.close)
+    app.on_shutdown(shutdown)
     from .api import build_router
     from .pages import register_pages
 

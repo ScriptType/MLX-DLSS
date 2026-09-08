@@ -1,0 +1,107 @@
+"""Shared Swift arguments for live previews and native video exports."""
+from __future__ import annotations
+
+import json
+import os
+import platform
+import re
+import subprocess
+import tempfile
+from pathlib import Path
+
+from .effects import FrameGen, NeuralRender, OutputOptions
+
+
+def available(settings, effects, source: Path) -> bool:
+    version = platform.mac_ver()[0].split(".")[0]
+    return (platform.system() == "Darwin" and version.isdigit() and int(version) >= 26
+            and source.suffix.lower() not in {".mkv", ".webm", ".avi"}
+            and all(settings.resolved_backend(e.kind) == "mlxdlss" for e in effects)
+            and (bool(effects) or settings.resolved_backend("fg") == "mlxdlss")
+            and not any(isinstance(e, NeuralRender) and e.motion == "flow" for e in effects))
+
+
+def rendering_arguments(nr: NeuralRender | None, settings, *, video: bool) -> list[str]:
+    if nr is None:
+        return []
+    if not settings.nr_model:
+        raise ValueError("Choose a Metal model in Settings")
+    args = ["--model", str(Path(settings.nr_model).expanduser()), "--profile", nr.profile]
+    for name in ("processing_scale", "detail_strength", "colour_strength", "detail_radius", "intensity"):
+        args += ["--" + name.replace("_", "-"), str(getattr(nr, name))]
+    if video:
+        args += ["--temporal", "on" if nr.temporal else "off", "--motion", nr.motion,
+                 "--scene-cut-threshold", str(nr.scene_cut_threshold)]
+    return args
+
+
+def video_arguments(source, target, effects, settings, output: OutputOptions) -> list[str]:
+    from ..mlxdlss_stream import find_mlxdlss
+
+    nr = next((e for e in effects if isinstance(e, NeuralRender)), None)
+    fg = next((e for e in effects if isinstance(e, FrameGen)), None)
+    args = [find_mlxdlss(settings.mlxdlss_binary or None), "process-video", str(source), "--output", str(target)]
+    args += rendering_arguments(nr, settings, video=True)
+    audio = output.include_audio and (fg is None or fg.audio != "none")
+    args += ["--codec", output.codec, "--audio", "on" if audio else "off", "--start-frame", str(output.start_frame)]
+    if output.frame_limit is not None:
+        args += ["--frames", str(output.frame_limit)]
+    if fg is not None:
+        if not settings.fg_weights:
+            raise ValueError("Choose frame-generation weights in Settings")
+        args += ["--framegen-weights", str(Path(settings.fg_weights).expanduser()), "--factor", str(fg.factor),
+                 "--slow-motion", "on" if fg.mode == "slowmo" else "off",
+                 "--order", "fg-nr" if effects[0].kind == "fg" else "nr-fg"]
+    return args
+
+
+def run_media(command, report, should_stop) -> dict:
+    from .runners import Cancelled
+
+    output_index = command.index("--output") + 1
+    target = Path(command[output_index])
+    if target.exists():
+        raise FileExistsError(f"Output already exists: {target.name}")
+    # Keep encoder staging and temporary audio inside a single owned directory,
+    # including when cancellation kills Swift before its defers can run.
+    with tempfile.TemporaryDirectory(prefix=".native-", dir=target.parent) as directory:
+        pending = Path(directory) / target.name
+        args = list(command)
+        args[output_index] = str(pending)
+        result = _run(args, report, should_stop, {**os.environ, "TMPDIR": directory})
+        if should_stop():
+            raise Cancelled()
+        os.link(pending, target)
+        result["output"] = target.resolve().as_uri()
+        return result
+
+
+def _run(command, report, should_stop, environment) -> dict:
+    """Drain progress without filling a pipe; cancellation also reaps the child."""
+    from .runners import Cancelled
+
+    with tempfile.TemporaryFile() as errors:
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=errors, text=True, env=environment)
+        try:
+            while True:
+                if should_stop():
+                    raise Cancelled()
+                try:
+                    stdout, _ = process.communicate(timeout=0.15)
+                    break
+                except subprocess.TimeoutExpired:
+                    lines = os.pread(errors.fileno(), 1_000_000, 0).decode(errors="replace")
+                    matches = re.findall(r"(\d+)/(\d+) input frames, (\d+) output", lines)
+                    if matches:
+                        done, total, out = map(int, matches[-1])
+                        report(f"{done} input → {out} output frames", min(0.97, done / max(1, total)), done, total)
+            if process.returncode:
+                errors.seek(0)
+                raise RuntimeError(errors.read().decode(errors="replace")[-2000:] or "Native video processing failed")
+            return json.loads(stdout)
+        finally:
+            if process.poll() is None:
+                process.kill()
+            process.wait()
+            if process.stdout:
+                process.stdout.close()

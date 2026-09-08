@@ -23,6 +23,7 @@ class Settings:
     precision: str = "reference"  # torch precision for neural rendering (reference | fast ...)
     mlxdlss_binary: str = ""          # explicit path to mlxdlss (default: PATH or the repository build)
     theme_dark: bool = False
+    output_directory: str = ""
 
     @property
     def root_path(self) -> Path:
@@ -30,7 +31,7 @@ class Settings:
 
     @property
     def outputs(self) -> Path:
-        return self.root_path / "outputs"
+        return Path(self.output_directory).expanduser() if self.output_directory else self.root_path / "outputs"
 
     @property
     def uploads(self) -> Path:

@@ -36,7 +36,7 @@ jobs retain their explicit settings. See the [rendering controls](../README.md#c
 
 ## Video CLI and web UI
 
-Video requires `ffmpeg` and `ffprobe` in `PATH`:
+The portable video CLI requires `ffmpeg` and `ffprobe` in `PATH`:
 
 ```sh
 mlxdlss-video convert in.mp4 out.mp4 --weights weights/dlssnr-weights-logical.safetensors --device cuda
@@ -51,8 +51,21 @@ pass FFmpeg options. `--pix-fmt rgb48le` retains 16-bit sources. Default encodin
 is H.264 CRF 18, medium preset, yuv420p. FG's `fps` mode keeps duration; `slowmo`
 stretches it, with `--audio copy|stretch|none` controlling sound.
 
-Web jobs run one at a time and save to `~/MLX-DLSS/outputs/<job>/`. The web UI
-shows completed results; live settings previews are currently SwiftUI-only.
+The web UI has live image/video previews, a frame timeline, batch export,
+NR/FG ordering, slow motion, codec/audio/range controls, cancellation and retry.
+Preview warms up to three preceding frames; FG runs only on export.
+
+On macOS 26+, Metal previews and exports use the app’s native media pipeline.
+MKV/WebM/AVI, explicit OpenCV motion and other backends use the portable path;
+Vision/VideoToolbox motion requires native media. FFmpeg is optional for native
+exports and required for completed side-by-side comparisons. Rebuild Swift
+when updating the web package.
+
+Jobs run one at a time in `~/MLX-DLSS/outputs/<job>/`. Settings can switch the
+output folder and its job history; previous files remain untouched. Clearing
+finished jobs hides them without deleting results. The HTTP API accepts an
+optional JSON `output_options` form field (`codec`, `include_audio`,
+`start_frame`, `frame_limit`); retry clones a failed or cancelled job.
 `mlxdlss-web --native` is a Python/pywebview window. See [HTTP routes](mlxdlss/web/api.py)
 and the [image](../docs/assets/web-image.png), [video](../docs/assets/web-video.png)
 and [queue](../docs/assets/web-jobs.png) screenshots.

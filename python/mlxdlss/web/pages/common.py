@@ -61,7 +61,7 @@ def layout(title: str, lead: str | None = None):
         yield
 
 
-def effect_editor(kind: str, initial: list[dict] | None = None) -> Callable[[], list[dict]]:
+def effect_editor(kind: str, initial: list[dict] | None = None, *, on_change=lambda: None) -> Callable[[], list[dict]]:
     """Effect cards for ``kind`` (image | video); returns a getter for the ordered chain.
 
     ``initial`` (a job's effect list) preloads the controls, so a reopened result shows what produced it."""
@@ -71,40 +71,45 @@ def effect_editor(kind: str, initial: list[dict] | None = None) -> Callable[[], 
     fg0 = next((e for e in initial if e.get("kind") == "fg"), None)
     with ds.card("Neural rendering") as box:
         with box.meta:
-            nr_enabled = ui.switch(value=nr0 is not None or not initial).props("dense color=primary")
+            nr_enabled = ui.switch(value=nr0 is not None or not initial).props('dense color=primary aria-label="Enable rendering"')
         if not settings.has_nr_weights():
             ui.label("Weights are not configured yet — add them in Settings.").classes("mlxdlss-warn mlxdlss-small")
         box.body.bind_visibility_from(nr_enabled, "value")
         with ui.element("div").classes("mlxdlss-stack"):
             nr0 = nr0 or {}
             profile = ds.segmented_row("Profile", list(PROFILE_NAMES), value=nr0.get("profile", "standard"))
-            scale = ds.slider_row("Processing scale", value=float(nr0.get("processing_scale", 1.0)), minimum=1.0, maximum=4.0, step=0.5, hint="Runs the network on the frame resampled by this factor; 2 is the photoreal setting.")
-            detail = ds.slider_row("Detail", value=float(nr0.get("detail_strength", 1.0)), minimum=0.0, maximum=4.0, step=0.1)
+            scale = ds.slider_row("Processing scale", value=float(nr0.get("processing_scale", 1.0)), minimum=1.0, maximum=4.0, step=0.1, hint="Higher values add detail and processing time.")
+            detail = ds.slider_row("Detail", value=float(nr0.get("detail_strength", 1.0)), minimum=0.0, maximum=8.0, step=0.1)
             colour = ds.slider_row("Colour", value=float(nr0.get("colour_strength", 1.0)), minimum=0.0, maximum=4.0, step=0.1)
-            radius = ds.slider_row("Detail radius", value=float(nr0.get("detail_radius", 4.0)), minimum=1.0, maximum=16.0, step=0.5)
+            with ui.expansion("Detail radius").classes("w-full"):
+                radius = ds.slider_row("Radius", value=float(nr0.get("detail_radius", 4.0)), minimum=0.5, maximum=64.0, step=0.5)
             intensity = ds.slider_row("Intensity", value=float(nr0.get("intensity", 1.0)), minimum=0.0, maximum=2.0, step=0.1)
-            temporal = None
+            temporal = motion = threshold = None
             if kind == "video":
                 temporal = ds.switch_row("Temporal", "Keep generated detail stable using motion and reliable history.", value=bool(nr0.get("temporal", not initial)))
+                with ui.expansion("Motion and scene cuts").classes("w-full"):
+                    motion = ui.select({"automatic": "Automatic", "videotoolbox": "VideoToolbox", "vision": "Vision",
+                                        "flow": "OpenCV", "zero": "Zero (diagnostic)"}, value=nr0.get("motion", "automatic"), label="Motion").props("outlined dense").classes("w-full")
+                    ui.label("VideoToolbox and Vision use native Metal media on macOS 26.").classes("mlxdlss-muted mlxdlss-small")
+                    threshold = ds.slider_row("Scene cut threshold", value=nr0.get("scene_cut_threshold", 0.3), minimum=0, maximum=1, step=0.01)
     fg_enabled = fg_mode = fg_factor = fg_audio = order = None
     if kind == "video":
         with ds.card("Frame generation") as box:
             with box.meta:
-                fg_enabled = ui.switch(value=fg0 is not None).props("dense color=primary")
+                fg_enabled = ui.switch(value=fg0 is not None).props('dense color=primary aria-label="Generate frames"')
             if not settings.has_fg_weights():
                 ui.label("Weights are not configured yet — run mlxdlss-weights extract-fg and add the file in Settings.").classes("mlxdlss-warn mlxdlss-small")
             box.body.bind_visibility_from(fg_enabled, "value")
             with ui.element("div").classes("mlxdlss-stack"):
                 fg0 = fg0 or {}
-                fg_mode = ds.segmented_row("Mode", {"fps": "Higher frame rate", "slowmo": "Slow motion"}, value=fg0.get("mode", "fps"),
-                                           hint="Higher frame rate keeps the duration; slow motion keeps the rate and stretches the clip.")
-                fg_factor = ds.segmented_row("Factor", {2: "×2", 3: "×3", 4: "×4"}, value=int(fg0.get("factor", 2)))
+                fg_mode = ds.segmented_row("Mode", {"fps": "Higher frame rate", "slowmo": "Slow motion"}, value=fg0.get("mode", "fps"))
+                fg_factor = ds.segmented_row("Factor", {2: "×2", 3: "×3", 4: "×4", 8: "×8", 16: "×16"}, value=int(fg0.get("factor", 2)))
                 fg_audio = ds.segmented_row("Audio", {"copy": "Copy", "stretch": "Stretch", "none": "Drop"}, value=fg0.get("audio", "copy"),
                                             hint="Stretch keeps the pitch and only applies to slow motion.")
-        with ds.card("Order"):
-            first = initial[0].get("kind") if initial else "nr"
-            order = ds.segmented_row("When both are on", {"nr_first": "Render → generate", "fg_first": "Generate → render"}, value="fg_first" if first == "fg" else "nr_first",
-                                     hint="Generating first sends every frame, including generated ones, through the renderer.")
+                fg_mode.on_value_change(lambda e: fg_audio.set_value("stretch" if e.value == "slowmo" else "copy"))
+                first = initial[0].get("kind") if initial else "nr"
+                order = ds.segmented_row("Order", {"nr_first": "Render → generate", "fg_first": "Generate → render"},
+                                         value="fg_first" if first == "fg" else "nr_first")
 
     def chain() -> list[dict]:
         effects: list[dict] = []
@@ -113,6 +118,8 @@ def effect_editor(kind: str, initial: list[dict] | None = None) -> Callable[[], 
                   "colour_strength": float(colour.value), "detail_radius": float(radius.value), "intensity": float(intensity.value)}
             if temporal is not None:
                 nr["temporal"] = bool(temporal.value)
+                nr["motion"] = motion.value
+                nr["scene_cut_threshold"] = float(threshold.value)
             effects.append(nr)
         if fg_enabled is not None and fg_enabled.value:
             fg = {"kind": "fg", "mode": fg_mode.value, "factor": int(fg_factor.value), "audio": fg_audio.value}
@@ -122,7 +129,25 @@ def effect_editor(kind: str, initial: list[dict] | None = None) -> Callable[[], 
                 effects.append(fg)
         return effects
 
+    for control in (nr_enabled, profile, scale, detail, colour, radius, intensity, temporal, motion, threshold,
+                    fg_enabled, fg_mode, fg_factor, fg_audio, order):
+        if control is not None:
+            control.on_value_change(lambda _: on_change())
     return chain
+
+
+def output_editor(initial: dict | None = None):
+    values = initial or {}
+    with ds.card("Output"):
+        codec = ui.select({"h264": "H.264", "hevc": "HEVC", "prores": "ProRes 422 HQ"},
+                          value=values.get("codec", "h264"), label="Video codec").props("outlined dense").classes("w-full")
+        audio = ui.switch("Include audio", value=values.get("include_audio", True))
+        with ui.expansion("Video range").classes("w-full"):
+            start = ui.number("Start frame", value=values.get("start_frame", 0), min=0, step=1, precision=0).props("outlined dense")
+            limit = ui.number("Frame limit (0 = all)", value=values.get("frame_limit") or 0, min=0, step=1, precision=0).props("outlined dense")
+        ui.link("Output folder in Settings", "/settings").classes("mlxdlss-small")
+    return lambda: {"codec": codec.value, "include_audio": bool(audio.value),
+                    "start_frame": int(start.value or 0), "frame_limit": int(limit.value) if limit.value else None}
 
 
 def job_status_card(job_id: str, *, on_done: Callable[[], None] | None = None) -> None:

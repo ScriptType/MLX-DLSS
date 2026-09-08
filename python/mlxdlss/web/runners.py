@@ -1,8 +1,7 @@
 """Executes a job's effect chain with the package's own pipelines.
 
-Images take neural rendering (torch); videos run the selected effects in one
-decode/effect/encode stream, using torch or the Swift Metal frame servers. A side-by-side preview is rendered with
-FFmpeg when a video job is done.
+Native Metal media handles supported macOS inputs; other paths use the
+portable pipelines. FFmpeg supplies optional completed-video comparisons.
 """
 from __future__ import annotations
 
@@ -15,7 +14,7 @@ from typing import Callable
 import numpy as np
 
 from ..video import find_tool, probe
-from .effects import FrameGen, NeuralRender, parse_effects
+from .effects import FrameGen, NeuralRender, OutputOptions, parse_effects
 from .jobs import Job
 from .settings import Settings
 
@@ -27,6 +26,7 @@ class ModelCache:
 
     def __init__(self):
         self._lock = threading.Lock()
+        self.execution_lock = threading.RLock()
         self._nr: dict[tuple, object] = {}
         self._fg: dict[tuple, object] = {}
 
@@ -60,17 +60,23 @@ class JobRunner:
 
     # -- entry point ------------------------------------------------------------
     def __call__(self, job: Job, folder: Path, report: Report, should_stop: Callable[[], bool]) -> list[Path]:
+        with self.cache.execution_lock:
+            if should_stop():
+                raise Cancelled()
+            return self._run(job, folder, report, should_stop)
+
+    def _run(self, job: Job, folder: Path, report: Report, should_stop: Callable[[], bool]) -> list[Path]:
         settings = self.settings_provider()
         job.backend = "/".join(sorted({settings.resolved_backend(e.get("kind", "nr")) for e in job.effects}))
         effects = parse_effects(job.effects)
         source = folder / ("input" + Path(job.input_name).suffix.lower())
         if job.kind == "image":
-            return [self._image(source, folder, effects, settings, report)]
+            return [self._image(source, folder, effects, settings, report, should_stop)]
         return self._video(source, folder, effects, settings, report, should_stop, job)
 
     # -- images -------------------------------------------------------------------
-    def _image(self, source: Path, folder: Path, effects, settings: Settings, report: Report) -> Path:
-        from PIL import Image
+    def _image(self, source: Path, folder: Path, effects, settings: Settings, report: Report, should_stop=lambda: False) -> Path:
+        from PIL import Image, ImageOps
 
         nr = next(e for e in effects if isinstance(e, NeuralRender))
         out = folder / "result.png"
@@ -82,20 +88,23 @@ class JobRunner:
             if not settings.nr_model:
                 raise ValueError("set the .dlssmodel package for the Metal backend in Settings")
             report("neural rendering", 0.2, 0, 1)
-            command = [find_mlxdlss(settings.mlxdlss_binary or None), "render-image", str(source), str(Path(settings.nr_model).expanduser()),
-                       "--output", str(out), "--execution", "metal-fused", "--precision", "float16", "--profile", nr.profile,
-                       "--processing-scale", f"{nr.processing_scale:g}", "--detail-strength", f"{nr.detail_strength:g}",
-                       "--colour-strength", f"{nr.colour_strength:g}", "--detail-radius", f"{nr.detail_radius:g}", "--intensity", f"{nr.intensity:g}"]
-            completed = subprocess.run(command, capture_output=True, text=True)
-            if completed.returncode != 0:
-                raise RuntimeError(f"mlxdlss render-image failed: {completed.stderr.strip()[-500:]}")
+            from . import native
+            binary = find_mlxdlss(settings.mlxdlss_binary or None)
+            arguments = native.rendering_arguments(nr, settings, video=False)
+            if native.available(settings, [nr], source):
+                command = [binary, "process-image", str(source), "--output", str(out)] + arguments
+            else:
+                command = [binary, "render-image", str(source), arguments[1], "--output", str(out),
+                           "--execution", "metal-fused", "--precision", "float16"] + arguments[2:]
+            native.run_media(command, report, should_stop)
             report("done", 1.0, 1, 1)
             return out
         if not settings.nr_weights:
             raise ValueError("set the neural rendering weights (logical safetensors) in Settings")
         report("loading the network", 0.05, 0, None)
         pipeline = self.cache.neural_rendering(settings.nr_weights, settings.device, settings.precision)
-        image = np.asarray(Image.open(source).convert("RGB"), np.float32) / 255.0
+        with Image.open(source) as original:
+            image = np.asarray(ImageOps.exif_transpose(original).convert("RGB"), np.float32) / 255.0
         report("neural rendering", 0.2, 0, 1)
         result = pipeline.enhance(
             image, profile=nr.profile, processing_scale=nr.processing_scale, detail_strength=nr.detail_strength,
@@ -107,9 +116,32 @@ class JobRunner:
 
     # -- videos -------------------------------------------------------------------
     def _video(self, source: Path, folder: Path, effects, settings: Settings, report: Report, should_stop, job: Job) -> list[Path]:
+        from . import native
         from ..video import ConvertOptions
         from ..video_pipeline import NeuralRenderStage, run_video
 
+        output = OutputOptions.model_validate(job.output_options)
+        target = folder / ("result.mov" if output.codec == "prores" else "result.mp4")
+        # An explicit legacy slowmo/copy choice keeps its original audio semantics.
+        legacy_audio = any(isinstance(e, FrameGen) and e.mode == "slowmo" and e.audio == "copy"
+                           and output.include_audio for e in effects)
+        if native.available(settings, effects, source) and not legacy_audio:
+            report("native media processing", 0.02, 0, None)
+            result = native.run_media(native.video_arguments(source, target, effects, settings, output), report, should_stop)
+            nr = next((e for e in effects if isinstance(e, NeuralRender)), None)
+            job.diagnostics = {"temporal": bool(nr and nr.temporal), "motion": result["motionBackend"],
+                               "processing_scale": nr.processing_scale if nr else 1,
+                               "scene_cuts": result["sceneResets"], "timing": result.get("timing"), "pipeline": "native"}
+            report("done", 1, result["inputFrames"], result["inputFrames"])
+            aligned = not output.start_frame and not any(isinstance(e, FrameGen) and e.mode == "slowmo" for e in effects)
+            if aligned:
+                report("rendering the comparison", 0.98, result["inputFrames"], result["inputFrames"])
+                preview = self._preview(source, target, folder)
+                if preview is not None:
+                    job.preview = preview.name
+            if should_stop():
+                raise Cancelled()
+            return [target]
         stages = []
         for effect in effects:
             if should_stop():
@@ -117,13 +149,19 @@ class JobRunner:
             if isinstance(effect, NeuralRender):
                 stages.append(self._neural_rendering_stage(effect, settings))
             else:
+                if not output.include_audio:
+                    effect = effect.model_copy(update={"audio": "none"})
                 stages.append(self._frame_generation_stage(effect, settings, floating=len(effects) > 1))
         name = " → ".join("neural rendering" if isinstance(e, NeuralRender) else f"frame generation x{e.factor}" for e in effects)
         def progress(done, total):
             fraction = done / total if total else 0.0
             report(f"{name} {done}/{total if total is not None else '?'}", min(0.97, fraction * 0.97), done, total)
-        target = folder / "result.mp4"
-        run_video(source, target, stages, ConvertOptions(overwrite=True, status_interval=1e9),
+        codecs = {"h264": None,
+                  "hevc": ["-c:v", "libx265", "-crf", "18", "-pix_fmt", "yuv420p", "-tag:v", "hvc1", "-movflags", "+faststart"],
+                  "prores": ["-c:v", "prores_ks", "-profile:v", "3", "-pix_fmt", "yuv422p10le"]}
+        run_video(source, target, stages, ConvertOptions(overwrite=True, status_interval=1e9,
+                  start_frame=output.start_frame, frame_limit=output.frame_limit, encode_args=codecs[output.codec],
+                  audio="copy" if output.include_audio else "none"),
                   log=lambda _m: None, progress=progress, should_stop=should_stop)
         for stage in stages:
             if isinstance(stage, NeuralRenderStage):
@@ -133,7 +171,9 @@ class JobRunner:
         if should_stop():
             raise Cancelled()
         report("rendering the preview", 0.98, job.frames_done, job.frames_total)
-        preview = self._preview(source, target, folder)
+        # A trimmed or slowed result no longer aligns with the original's clock.
+        aligned = not output.start_frame and not any(isinstance(e, FrameGen) and e.mode == "slowmo" for e in effects)
+        preview = self._preview(source, target, folder) if aligned else None
         if preview is not None:
             job.preview = preview.name
         return [target]
@@ -143,19 +183,24 @@ class JobRunner:
         from ..video_pipeline import NeuralRenderStage
 
         backend = settings.resolved_backend("nr")
+        if nr.motion in {"vision", "videotoolbox"} and nr.temporal:
+            raise ValueError("Vision/VideoToolbox motion needs native Metal media on macOS 26; choose Automatic or OpenCV for this input")
+        motion = "flow" if nr.motion == "automatic" else nr.motion
         enhance = {"profile": nr.profile, "processing_scale": nr.processing_scale, "detail_strength": nr.detail_strength,
                    "colour_strength": nr.colour_strength, "detail_radius": nr.detail_radius, "intensity": nr.intensity}
         if backend == "mlxdlss":
             if not settings.nr_model:
                 raise ValueError("set the .dlssmodel package for the Metal backend in Settings")
             options = ConvertOptions(backend="mlxdlss", model_package=str(Path(settings.nr_model).expanduser()), mlxdlss=settings.mlxdlss_binary or None,
-                                     temporal=nr.temporal, overwrite=True, status_interval=1e9, enhance=enhance)
+                                     temporal=nr.temporal, motion=motion, scene_cut_threshold=nr.scene_cut_threshold,
+                                     overwrite=True, status_interval=1e9, enhance=enhance)
             pipeline = None
         else:
             if not settings.nr_weights:
                 raise ValueError("set the neural rendering weights (logical safetensors) in Settings")
             pipeline = self.cache.neural_rendering(settings.nr_weights, settings.device, settings.precision)
-            options = ConvertOptions(temporal=nr.temporal, overwrite=True, status_interval=1e9, enhance=enhance)
+            options = ConvertOptions(temporal=nr.temporal, motion=motion, scene_cut_threshold=nr.scene_cut_threshold,
+                                     overwrite=True, status_interval=1e9, enhance=enhance)
         return NeuralRenderStage(pipeline, options)
 
     def _frame_generation_stage(self, fg: FrameGen, settings: Settings, *, floating=False):

@@ -38,13 +38,13 @@ def build_router(state: WebState) -> APIRouter:
         return j.to_dict()
 
     @router.post("/jobs")
-    async def create(file: UploadFile = File(...), effects: str = Form(...)) -> JSONResponse:
+    async def create(file: UploadFile = File(...), effects: str = Form(...), output_options: str = Form("{}")) -> JSONResponse:
         try:
             chain = json.loads(effects)
             if not isinstance(chain, list):
                 raise ValueError("effects must be a JSON list")
             data = await file.read()
-            j = state.store.create(file.filename or "upload.bin", chain, data=data)
+            j = state.store.create(file.filename or "upload.bin", chain, data=data, output_options=json.loads(output_options))
         except ValueError as error:
             raise HTTPException(400, str(error)) from error
         state.queue.submit(j)
@@ -55,6 +55,18 @@ def build_router(state: WebState) -> APIRouter:
         if not state.queue.cancel(job_id):
             raise HTTPException(404, "no such job")
         return state.store.get(job_id).to_dict()
+
+    @router.post("/jobs/{job_id}/retry")
+    def retry(job_id: str) -> JSONResponse:
+        original = state.store.get(job_id)
+        if original is None:
+            raise HTTPException(404, "no such job")
+        try:
+            retried = state.store.retry(original)
+        except ValueError as error:
+            raise HTTPException(409, str(error)) from error
+        state.queue.submit(retried)
+        return JSONResponse(retried.to_dict(), status_code=201)
 
     @router.delete("/jobs/{job_id}")
     def delete(job_id: str) -> dict:

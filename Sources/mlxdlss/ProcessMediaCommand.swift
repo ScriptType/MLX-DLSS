@@ -30,7 +30,7 @@ enum ProcessMediaCommand {
     try CLIOutput.writeEncodable(result)
   }
 
-  static func parse(arguments: [String], video: Bool) throws -> Parsed {
+  static func parse(arguments: [String], video: Bool, requireEffect: Bool = true) throws -> Parsed {
     guard let input = arguments.first, !input.hasPrefix("--") else {
       throw CLIError.usage("process-\(video ? "video" : "image") requires INPUT --output PATH --model MODEL or --framegen-weights WEIGHTS")
     }
@@ -90,7 +90,9 @@ enum ProcessMediaCommand {
     options.startFrame = try integer("--start-frame", 0)
     if values["--frames"] != nil { options.frameLimit = try integer("--frames", 0) }
     if values["--bitrate"] != nil { options.bitrate = try integer("--bitrate", 0) }
-    try options.validate()
+    if requireEffect || options.renderingModel != nil || options.frameGenerationWeights != nil {
+      try options.validate()
+    }
     return Parsed(input: URL(fileURLWithPath: input), output: URL(fileURLWithPath: output), options: options)
   }
 }

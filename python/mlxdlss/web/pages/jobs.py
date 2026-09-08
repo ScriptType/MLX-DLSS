@@ -24,6 +24,7 @@ def _effects_summary(effects: list[dict]) -> str:
 def jobs_page() -> None:
     state = get_state()
     with layout("Jobs", "Jobs run one at a time. Results stay in the output folder until you delete them."):
+        ds.button("Clear finished", kind="secondary", on_click=lambda: (state.store.clear_finished(), rows.refresh()))
         with ds.card(tight=True):
 
             @ui.refreshable
@@ -49,6 +50,8 @@ def jobs_page() -> None:
                             if job.error:
                                 ui.label(job.error).classes("mlxdlss-bad mlxdlss-small mt-1")
                         with ui.element("div").classes("mlxdlss-actions"):
+                            if job.state in ("failed", "cancelled"):
+                                ds.button("Retry", kind="secondary", on_click=lambda j=job: (state.queue.submit(state.store.retry(j)), rows.refresh()))
                             if job.state in ("queued", "running"):
                                 ds.button("Cancel", kind="danger", on_click=lambda j=job: (state.queue.cancel(j.id), rows.refresh()))
                             if job.state == "done" and job.outputs:

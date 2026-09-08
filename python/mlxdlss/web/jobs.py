@@ -16,7 +16,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Callable
 
-from .effects import FrameGen, NeuralRender, media_kind, parse_effects, validate_chain
+from .effects import OutputOptions, media_kind, parse_effects, validate_chain
 
 STATES = ("queued", "running", "done", "failed", "cancelled")
 
@@ -40,6 +40,8 @@ class Job:
     finished: float | None = None
     backend: str = ""
     diagnostics: dict = field(default_factory=dict)
+    output_options: dict = field(default_factory=dict)
+    archived: bool = False
 
     @property
     def seconds(self) -> float | None:
@@ -78,10 +80,12 @@ class JobStore:
     def folder(self, job_id: str) -> Path:
         return self.root / job_id
 
-    def create(self, input_name: str, effects_raw, *, data: bytes | None = None, source: Path | None = None) -> Job:
+    def create(self, input_name: str, effects_raw, *, data: bytes | None = None, source: Path | None = None,
+               output_options: dict | None = None) -> Job:
         kind = media_kind(input_name)
         effects = parse_effects(effects_raw, kind=kind)
         validate_chain(effects, kind)
+        output = OutputOptions.model_validate({} if output_options is None else output_options)
         job_id = time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
         folder = self.folder(job_id)
         folder.mkdir(parents=True, exist_ok=False)
@@ -89,10 +93,12 @@ class JobStore:
         if data is not None:
             target.write_bytes(data)
         elif source is not None:
-            target.write_bytes(Path(source).read_bytes())
+            import shutil
+            shutil.copyfile(source, target)
         else:
             raise ValueError("a job needs file data or a source path")
-        job = Job(id=job_id, created=time.time(), input_name=input_name, kind=kind, effects=[e.model_dump() for e in effects])
+        job = Job(id=job_id, created=time.time(), input_name=input_name, kind=kind, effects=[e.model_dump() for e in effects],
+                  output_options=output.model_dump())
         with self._lock:
             self._jobs[job_id] = job
         self.save(job)
@@ -107,7 +113,18 @@ class JobStore:
 
     def list(self) -> list[Job]:
         with self._lock:
-            return sorted(self._jobs.values(), key=lambda j: j.created, reverse=True)
+            return sorted((j for j in self._jobs.values() if not j.archived), key=lambda j: j.created, reverse=True)
+
+    def retry(self, job: Job) -> Job:
+        if job.state not in {"failed", "cancelled"}:
+            raise ValueError("Only failed or cancelled jobs can be retried")
+        return self.create(job.input_name, job.effects, source=self.input_path(job), output_options=job.output_options)
+
+    def clear_finished(self) -> None:
+        for job in self.list():
+            if job.state in {"done", "failed", "cancelled"}:
+                job.archived = True
+                self.save(job)
 
     def input_path(self, job: Job) -> Path:
         return self.folder(job.id) / ("input" + Path(job.input_name).suffix.lower())
@@ -166,6 +183,8 @@ class JobQueue:
     def _loop(self) -> None:
         while True:
             job_id = self._queue.get()
+            if job_id is None:
+                return
             job = self.store.get(job_id)
             if job is None or job.state != "queued":
                 continue
@@ -184,11 +203,17 @@ class JobQueue:
                     job.outputs = [p.name for p in outputs]
                     job.state, job.progress = "done", 1.0
             except Exception as error:  # the job must never take the worker down
-                job.state = "failed"
-                job.error = f"{error}"
-                (self.store.folder(job.id) / "error.log").write_text(traceback.format_exc())
+                job.state = "cancelled" if self._should_stop(job.id) else "failed"
+                if job.state == "failed":
+                    job.error = f"{error}"
+                    (self.store.folder(job.id) / "error.log").write_text(traceback.format_exc())
             finally:
                 job.finished = time.time()
                 with self._lock:
                     self._cancel.discard(job.id)
                 self.store.save(job); self._notify(job)
+
+    def close(self) -> None:
+        """Drain the worker before replacing an idle store or shutting down."""
+        self._queue.put(None)
+        self._thread.join()

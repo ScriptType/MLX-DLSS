@@ -23,11 +23,11 @@ weights are included or downloaded.
 | Mode | Runtime | Preview |
 | --- | --- | --- |
 | macOS app | Swift, Metal, AVFoundation | Live settings; select a video frame on the timeline |
-| Web UI | Python, NiceGUI, FFmpeg, OpenCV; Metal or PyTorch inference | Compare completed jobs |
+| Web UI | Python, NiceGUI; native Metal media or PyTorch/FFmpeg | Live settings and video timeline |
 | CLI / Python API | Native Metal or PyTorch | File output |
 
-The web UI shares Metal kernels through the updated Swift binary. Live settings
-previews are app-only; the native media pipeline serves the app and CLI.
+On macOS 26+, the web UI uses the same native preview and media pipeline as
+the app. Other platforms use the portable Python pipeline.
 `mlxdlss-web --native` is a separate pywebview wrapper and still needs Python.
 
 ## macOS quick start
@@ -46,6 +46,8 @@ or FFmpeg at runtime.
 Temporal rendering is on by default. Live preview uses up to three preceding
 frames; export uses the full sequence and applies frame generation. Native
 video output is SDR 8-bit; PNG/TIFF stills retain 16-bit output.
+
+![Native macOS app with temporal preview and frame generation](docs/assets/native-app.png)
 
 ## Weights
 
@@ -88,16 +90,22 @@ audio. Existing output files are preserved. [More options and APIs](docs/embeddi
 
 ## Web and Python
 
-Requires Python 3.10+ and FFmpeg/ffprobe for video:
+Requires Python 3.10+. FFmpeg/ffprobe serve portable video and comparisons:
 
 ```sh
 python3 -m pip install './python[web,video]'
 mlxdlss-web                       # http://127.0.0.1:8181
 ```
 
-Set weight paths and backend in **Settings**. The web UI supports images,
-video effect chains, queues, cancellation and downloads. Temporal rendering
-defaults to on for new videos; saved settings are kept.
+Set weights and backend in **Settings**. Preview images or a selected video
+frame while adjusting controls. Export batches with NR/FG in either order,
+FG ×2–16, slow motion, H.264/HEVC/ProRes, audio and frame ranges. Jobs support
+cancel, retry and downloads; the output folder is configurable.
+
+Temporal is on for new videos. Preview uses up to three preceding frames;
+frame generation runs on export. Saved jobs retain their settings.
+
+![Web panel with temporal preview and export controls](docs/assets/web-video.png)
 
 For the web's Metal backend (image/tensor APIs support macOS 14+):
 
