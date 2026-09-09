@@ -11,6 +11,8 @@ public enum NeuralRenderingDisplayCodecError: Error, Equatable, Sendable {
 }
 
 public struct NeuralRenderingDisplayCodecConfiguration: Equatable, Sendable {
+  public enum WorkingPrimaries: Sendable { case bt709, bt2020 }
+  public let workingPrimaries: WorkingPrimaries
   public let whitePoint: Float
   public let transferStrength: Float
   public let colorStrength: Float
@@ -22,8 +24,10 @@ public struct NeuralRenderingDisplayCodecConfiguration: Equatable, Sendable {
     transferStrength: Float = 1,
     colorStrength: Float = 1,
     maximumLuminanceRatio: Float = 2,
-    inputIsDisplayReferred: Bool = false
+    inputIsDisplayReferred: Bool = false,
+    workingPrimaries: WorkingPrimaries = .bt709
   ) {
+    self.workingPrimaries = workingPrimaries
     self.whitePoint = whitePoint
     self.transferStrength = transferStrength
     self.colorStrength = colorStrength
@@ -57,6 +61,7 @@ public enum NeuralRenderingDisplayCodec {
         SIMD3(source[offset], source[offset + 1], source[offset + 2])
       )
       var display = frame / configuration.whitePoint
+      if configuration.workingPrimaries == .bt2020 { display = toBT709(display) }
       let displayLuminance = luminance(display)
       if displayLuminance > 0.75 {
         let rolled =
@@ -125,6 +130,22 @@ public enum NeuralRenderingDisplayCodec {
           originalValues[offset + 2]
         ) / normalization
 
+      if configuration.workingPrimaries == .bt2020 {
+        // Transfer a bounded SDR change onto the retained wide-gamut original.
+        // Identity model => gain 1 and residual 0, including out-of-proxy gamut.
+        let proxyLuminance = luminance(proxyPixel)
+        if proxyLuminance <= 0.000_001 {
+          output += [originalValues[offset], originalValues[offset + 1], originalValues[offset + 2]]
+          continue
+        }
+        let gain = min(configuration.maximumLuminanceRatio, max(0, luminance(modelPixel) / proxyLuminance))
+        let residual = toBT2020(modelPixel - proxyPixel * gain)
+        let upgraded = originalPixel * gain + residual * configuration.colorStrength
+        let result = mix(originalPixel, upgraded, amount: configuration.transferStrength) * normalization
+        output += [result.x, result.y, result.z]
+        continue
+      }
+
       let modelLuminance = luminance(modelPixel)
       if modelLuminance <= 0.000_01 {
         output.append(originalValues[offset])
@@ -172,6 +193,18 @@ public enum NeuralRenderingDisplayCodec {
     }
 
     return try tensor(like: original, values: output)
+  }
+
+  private static func toBT709(_ v: SIMD3<Float>) -> SIMD3<Float> {
+    SIMD3(1.6604910*v.x - 0.5876411*v.y - 0.0728499*v.z,
+      -0.1245505*v.x + 1.1328999*v.y - 0.0083494*v.z,
+      -0.0181508*v.x - 0.1005789*v.y + 1.1187297*v.z)
+  }
+
+  private static func toBT2020(_ v: SIMD3<Float>) -> SIMD3<Float> {
+    SIMD3(0.6274039*v.x + 0.3292830*v.y + 0.0433131*v.z,
+      0.0690973*v.x + 0.9195404*v.y + 0.0113623*v.z,
+      0.0163914*v.x + 0.0880133*v.y + 0.8955953*v.z)
   }
 
   private static let luma = SIMD3<Float>(0.2126, 0.7152, 0.0722)

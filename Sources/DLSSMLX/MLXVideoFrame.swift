@@ -15,7 +15,11 @@ public struct MLXMediaError: Error, LocalizedError, Sendable {
 /// writing before handing it off, and must not modify it while consumers retain it.
 public struct MLXPixelBuffer: @unchecked Sendable {
   public let buffer: CVPixelBuffer
-  public init(_ buffer: CVPixelBuffer) { self.buffer = buffer }
+  /// Command-buffer GPU time, when this buffer was produced by the native writer.
+  public let gpuDurationSeconds: Double?
+  public init(_ buffer: CVPixelBuffer, gpuDurationSeconds: Double? = nil) {
+    self.buffer = buffer; self.gpuDurationSeconds = gpuDurationSeconds
+  }
   public var width: Int { CVPixelBufferGetWidth(buffer) }
   public var height: Int { CVPixelBufferGetHeight(buffer) }
 }
@@ -117,7 +121,7 @@ public actor MLXPixelBufferWriter {
         if (i >= dimensions.x * dimensions.y) return;
         uint base = (i / dimensions.x) * dimensions.z + (i % dimensions.x) * 4;
         for (uint c = 0; c < 3; ++c) {
-          float value = clamp(rgb[i * 3 + c], 0.0f, 1.0f);
+          float value = \(halfOutput ? "rgb[i * 3 + c]" : "clamp(rgb[i * 3 + c], 0.0f, 1.0f)");
           pixels[base + \(halfOutput ? "c" : "2 - c")] = \(halfOutput ? "half(value)" : "uchar(value * 255.0f + 0.5f)");
         }
         pixels[base + 3] = \(halfOutput ? "half(1.0f)" : "uchar(255)");
@@ -167,7 +171,8 @@ public actor MLXPixelBufferWriter {
       }
       command.commit()
     }
-    return result
+    let duration = command.gpuEndTime - command.gpuStartTime
+    return MLXPixelBuffer(pixelBuffer, gpuDurationSeconds: duration > 0 ? duration : nil)
   }
 }
 

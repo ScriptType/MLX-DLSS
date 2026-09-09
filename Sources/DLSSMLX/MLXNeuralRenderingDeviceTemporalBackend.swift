@@ -101,6 +101,7 @@ public actor MLXNeuralRenderingDeviceTemporalBackend: NeuralRenderBackend {
     _ frame: MLXVideoFrame, motion: MLXVideoMotion?,
     context: NeuralRenderFrameContext, processingScale: Float = 1, temporal: Bool = true,
     outputOptions: MLXVideoOutputOptions? = nil,
+    processingWidth: Int? = nil, processingHeight: Int? = nil,
     featureControls: NeuralRenderingFeatureControls? = nil, intensity: Float? = nil
   ) async throws -> MLXVideoFrame {
     guard !nativeFrameInFlight else { throw MLXMediaError("Submit native NR frames sequentially") }
@@ -116,8 +117,12 @@ public actor MLXNeuralRenderingDeviceTemporalBackend: NeuralRenderBackend {
       nativeCompositionOptions = options
     }
     let composition = nativeComposition!
-    let width = Int((Float(frame.width) * processingScale).rounded(.toNearestOrEven))
-    let height = Int((Float(frame.height) * processingScale).rounded(.toNearestOrEven))
+    let width = processingWidth ?? Int((Float(frame.width) * processingScale).rounded(.toNearestOrEven))
+    let height = processingHeight ?? Int((Float(frame.height) * processingScale).rounded(.toNearestOrEven))
+    guard width > 0, height > 0, width <= 16384, height <= 16384,
+      (processingWidth == nil) == (processingHeight == nil) else {
+      throw MLXMediaError("Specify both valid neural processing dimensions")
+    }
     let color = composition.resample(frame.array, width: width, height: height)
     if nativeGuides?.width != width || nativeGuides?.height != height {
       nativeGuides = (width, height, MLXArray.zeros([1, height, width, 2]),

@@ -17,7 +17,7 @@ final class MLXVideoFrameTests: XCTestCase, @unchecked Sendable {
       let actual = try MLXVideoFrame(pixelBuffer: buffer).array.asArray(Float.self)
       for (a, v) in zip(actual, values) {
         let bounded = max(0, min(1, v))
-        let expected = half ? Float(Float16(bounded)) : floor(bounded * 255 + 0.5) / 255
+        let expected = half ? Float(Float16(v)) : floor(bounded * 255 + 0.5) / 255
         XCTAssertEqual(a, expected, accuracy: 1e-7)
       }
     }

@@ -9,72 +9,45 @@ struct NativeDecodedFrame: Sendable {
   let duration: CMTime
 }
 
+/// SDR-export adapter around the retained-original HDR decoder. The file writer
+/// is explicitly SDR; playback uses NativeHDRVideoReader/NativeHDRProcessor.
 @available(macOS 26.0, *)
 actor NativeVideoReader {
   nonisolated let estimatedFrames: Int
   nonisolated let nominalFrameRate: Float
-  private let reader: AVAssetReader
-  private let provider: AVAssetReaderOutput.Provider<CMReadySampleBuffer<CMSampleBuffer.DynamicContent>>
-  private let transform: CGAffineTransform
+  private let reader: NativeHDRVideoReader
   private let imageIO: NativeImageIO
+  private let codec = MLXNeuralRenderingDisplayCodec()
   private let options: MediaProcessingOptions
-  private var index = 0
   private var emitted = 0
+  private var skipped = 0
 
   init(url: URL, options: MediaProcessingOptions, timeRange: CMTimeRange? = nil) async throws {
-    let asset = AVURLAsset(url: url)
-    guard let track = try await asset.loadTracks(withMediaType: .video).first else {
-      throw MLXMediaError("The file contains no video track")
-    }
-    let rate = try await track.load(.nominalFrameRate)
-    let duration = try await asset.load(.duration)
-    nominalFrameRate = rate.isFinite && rate > 0 ? rate : 30
-    let estimate = ceil(duration.seconds * Double(nominalFrameRate))
-    estimatedFrames = estimate.isFinite && estimate >= 0 && estimate < Double(Int.max)
-      ? min(options.frameLimit ?? Int.max, max(0, Int(estimate) - options.startFrame)) : 0
-    transform = try await track.load(.preferredTransform)
-    self.options = options
+    reader = try await NativeHDRVideoReader(url: url, timeRange: timeRange)
+    nominalFrameRate = reader.nominalFrameRate
+    estimatedFrames = min(options.frameLimit ?? Int.max, max(0, reader.estimatedFrames - options.startFrame))
     imageIO = try NativeImageIO()
-    reader = try AVAssetReader(asset: asset)
-    if let timeRange { reader.timeRange = timeRange }
-    let output = AVAssetReaderTrackOutput(track: track, outputSettings: [
-      kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
-      kCVPixelBufferIOSurfacePropertiesKey as String: [:],
-      kCVPixelBufferMetalCompatibilityKey as String: true,
-    ])
-    output.alwaysCopiesSampleData = false
-    guard reader.canAdd(output) else { throw MLXMediaError("Cannot attach native video decoder") }
-    provider = reader.outputProvider(for: output)
-    guard reader.startReading() else { throw reader.error ?? MLXMediaError("Cannot start native video decoder") }
+    self.options = options
   }
 
   func next() async throws -> NativeDecodedFrame? {
-    if let limit = options.frameLimit, emitted >= limit { reader.cancelReading(); return nil }
-    while true {
-      try Task.checkCancellation()
-      guard let sample = try await provider.next() else {
-        if reader.status == .failed { throw reader.error ?? MLXMediaError("Video decoding failed") }
-        return nil
+    if let limit = options.frameLimit, emitted >= limit { await reader.cancel(); return nil }
+    while let frame = try await reader.next() {
+      if skipped < options.startFrame { skipped += 1; continue }
+      var rgb = codec.encode(frame.original, configuration: .init(
+        whitePoint: frame.metadata.color.referenceWhiteNits, workingPrimaries: .bt2020))
+      if !frame.metadata.transform.isIdentity {
+        let writer = try MLXPixelBufferWriter(width: rgb.width, height: rgb.height, halfOutput: true)
+        let pixels = try await writer.write(rgb)
+        rgb = try await MLXVideoFrame(pixelBuffer: imageIO.convert(pixels, transform: frame.metadata.transform))
       }
-      let currentIndex = index
-      index += 1
-      if currentIndex < options.startFrame { continue }
-      guard case .pixelBuffer(let image) = sample.content else { throw MLXMediaError("Decoder returned no image") }
-      let time = sample.presentationTimeStamp
-      var duration = sample.duration
-      guard time.isNumeric else { throw MLXMediaError("Video frame has no presentation timestamp") }
-      if !duration.isNumeric || duration <= .zero {
-        duration = CMTime(seconds: 1 / Double(nominalFrameRate), preferredTimescale: 60000)
-      }
-      let original = image.withUnsafeBuffer { MLXPixelBuffer($0) }
-      let pixels = transform.isIdentity ? original : try await imageIO.convert(original, transform: transform)
-      let rgb = try MLXVideoFrame(pixelBuffer: pixels)
       emitted += 1
-      return NativeDecodedFrame(rgb: rgb, time: time, duration: duration)
+      return NativeDecodedFrame(rgb: rgb, time: frame.metadata.time, duration: frame.metadata.duration)
     }
+    return nil
   }
 
-  func cancel() { reader.cancelReading() }
+  func cancel() async { await reader.cancel() }
 }
 
 /// The audio producer advances independently from video under encoder backpressure.

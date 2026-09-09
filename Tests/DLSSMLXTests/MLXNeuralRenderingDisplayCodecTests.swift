@@ -97,6 +97,24 @@ final class MLXNeuralRenderingDisplayCodecTests: XCTestCase {
     XCTAssertEqual(output.asArray(Float.self), [4, 2, 1])
   }
 
+  func testBT2020IdentityAndEnhancedWideGamutMatchCPU() throws {
+    let original = try tensor([1000, 1, 0, 0, 1000, 0, 1000, 1000, 1000, -0.5, 20, 800], width: 4, height: 1)
+    let config = NeuralRenderingDisplayCodecConfiguration(whitePoint: 203, transferStrength: 0.7,
+      colorStrength: 0.5, maximumLuminanceRatio: 1.5, workingPrimaries: .bt2020)
+    let codec = MLXNeuralRenderingDisplayCodec()
+    let proxy = codec.encode(array(original), configuration: config)
+    let identity = codec.resolve(proxy: proxy, model: proxy, original: array(original), configuration: config)
+    assertClose(identity.asArray(Float.self), values(original), tolerance: 0.0002)
+    let hostProxy = try NeuralRenderingDisplayCodec.encode(original, configuration: config)
+    assertClose(proxy.asArray(Float.self), values(hostProxy), tolerance: 0.000002)
+    let hostModel = try tensor(values(hostProxy).map { min(1, max(0, $0 * 0.9 + 0.02)) }, width: 4, height: 1)
+    let expected = try NeuralRenderingDisplayCodec.resolve(proxy: hostProxy, model: hostModel,
+      original: original, configuration: config)
+    let actual = codec.resolve(proxy: proxy, model: array(hostModel), original: array(original), configuration: config)
+    assertClose(actual.asArray(Float.self), values(expected), tolerance: 0.0005)
+    XCTAssertGreaterThan(actual.asArray(Float.self).max()!, 203)
+  }
+
   private func tensor(
     _ values: [Float],
     width: Int,

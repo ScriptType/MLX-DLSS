@@ -20,6 +20,7 @@ public final class MLXNeuralRenderingDisplayCodec: @unchecked Sendable {
         float3(0.0f)
       );
       float3 display = frame / whitePoint;
+      if (workingBT2020) display = mlxdlssToBT709(display);
       float displayLuminance = mlxdlssDisplayLuminance(display);
       if (displayLuminance > 0.75f) {
         float rolled = 0.75f + 0.25f * (
@@ -66,6 +67,20 @@ public final class MLXNeuralRenderingDisplayCodec: @unchecked Sendable {
         original[offset], original[offset + 1], original[offset + 2]
       ) / normalization;
 
+      if (workingBT2020) {
+        float proxyLuminance = mlxdlssDisplayLuminance(proxyPixel);
+        if (proxyLuminance <= 0.000001f) {
+          output[offset] = original[offset]; output[offset+1] = original[offset+1]; output[offset+2] = original[offset+2];
+          return;
+        }
+        float gain = clamp(mlxdlssDisplayLuminance(modelPixel) / proxyLuminance, 0.0f, maximumRatio);
+        float3 residual = mlxdlssToBT2020(modelPixel - proxyPixel * gain);
+        float3 upgraded = originalPixel * gain + residual * colorStrength;
+        float3 result = mix(originalPixel, upgraded, transferStrength) * normalization;
+        output[offset] = result.x; output[offset+1] = result.y; output[offset+2] = result.z;
+        return;
+      }
+
       float modelLuminance = mlxdlssDisplayLuminance(modelPixel);
       if (modelLuminance <= 0.00001f) {
         output[offset] = original[offset];
@@ -106,6 +121,17 @@ public final class MLXNeuralRenderingDisplayCodec: @unchecked Sendable {
 
   public init() {}
 
+  public func encode(_ original: MLXVideoFrame, configuration: NeuralRenderingDisplayCodecConfiguration = .init()) -> MLXVideoFrame {
+    if configuration.inputIsDisplayReferred { return original }
+    return MLXVideoFrame(encode(original.array, configuration: configuration))
+  }
+
+  public func resolve(proxy: MLXVideoFrame, model: MLXVideoFrame, original: MLXVideoFrame,
+    configuration: NeuralRenderingDisplayCodecConfiguration = .init()) -> MLXVideoFrame {
+    if configuration.transferStrength == 0 { return original }
+    return MLXVideoFrame(resolve(proxy: proxy.array, model: model.array, original: original.array, configuration: configuration))
+  }
+
   public func encode(
     _ original: MLXArray,
     configuration: NeuralRenderingDisplayCodecConfiguration = .init()
@@ -118,6 +144,7 @@ public final class MLXNeuralRenderingDisplayCodec: @unchecked Sendable {
     return encodeKernel(
       [original],
       template: [
+        ("workingBT2020", configuration.workingPrimaries == .bt2020),
         ("whitePointBits", Int(configuration.whitePoint.bitPattern))
       ],
       grid: (original.shape[1] * original.shape[2], 1, 1),
@@ -144,6 +171,7 @@ public final class MLXNeuralRenderingDisplayCodec: @unchecked Sendable {
     return resolveKernel(
       [proxy, model, original],
       template: [
+        ("workingBT2020", configuration.workingPrimaries == .bt2020),
         ("whitePointBits", Int(configuration.whitePoint.bitPattern)),
         ("transferStrengthBits", Int(configuration.transferStrength.bitPattern)),
         ("colorStrengthBits", Int(configuration.colorStrength.bitPattern)),
@@ -182,6 +210,16 @@ private let neuralRenderingDisplayCodecMetalHeader = #"""
   #pragma clang fp contract(off)
   #pragma clang fp reassociate(off)
 
+  METAL_FUNC float3 mlxdlssToBT709(float3 v) {
+    return float3(dot(v,float3(1.6604910f,-0.5876411f,-0.0728499f)),
+      dot(v,float3(-0.1245505f,1.1328999f,-0.0083494f)),
+      dot(v,float3(-0.0181508f,-0.1005789f,1.1187297f)));
+  }
+  METAL_FUNC float3 mlxdlssToBT2020(float3 v) {
+    return float3(dot(v,float3(0.6274039f,0.3292830f,0.0433131f)),
+      dot(v,float3(0.0690973f,0.9195404f,0.0113623f)),
+      dot(v,float3(0.0163914f,0.0880133f,0.8955953f)));
+  }
   METAL_FUNC float mlxdlssDisplayLuminance(float3 value) {
     return value.x * 0.2126f + value.y * 0.7152f + value.z * 0.0722f;
   }
