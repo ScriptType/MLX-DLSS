@@ -22,6 +22,8 @@ KNOWN_DLL_SHA256 = {
     # the supported nvngx_dlssnr.dll: FileVersion 310.8.0.0 (WEIGHTS_HT resource, 153 packed tensors).
     # There is no separate "checkpoint version": the vNN numbers elsewhere in this project
     # (dlssnr-logical-v18, package names) are revisions of this decoder, not NVIDIA releases.
+    # The NVIDIA-signed original has the same WEIGHTS_HT bytes as the historical reference below.
+    "e16bcf15e16e13f527491cdf7845b2fe6521a738d8f7c9c721866a8496e1fc8e": "supported nvngx_dlssnr.dll (FileVersion 310.8.0.0, NVIDIA-signed original)",
     "ceb6432f6fbdf44d886014bcd47241932bf8b67439feef9bbdd0961436662650": "supported nvngx_dlssnr.dll (FileVersion 310.8.0.0)",
     # its packed intermediate as written by `mlxdlss-weights extract`
     "08a39bcd6c032c5fec20821c44abfd99a8ad85bbff460e5cc945f35ba67d67a3": "dlssnr-weights-packed.safetensors (WEIGHTS_HT of the supported DLL)",
