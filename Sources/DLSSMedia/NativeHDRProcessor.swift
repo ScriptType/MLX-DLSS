@@ -165,7 +165,8 @@ public actor NativeHDRProcessor {
         context: .init(streamID: metadata.streamID, frameIndex: metadata.frameIndex,
           discontinuity: resetHistory ? .explicit : nil), temporal: configuration.temporal,
         outputOptions: try .init(width: width, height: height),
-        processingWidth: configuration.processingWidth, processingHeight: configuration.processingHeight)
+        processingWidth: configuration.processingWidth, processingHeight: configuration.processingHeight,
+        processingInputRange: .boundedSRGB)
       timings.inferenceSeconds = seconds(since: stage)
       stage = .now
       enhanced = codec.resolve(proxy: proxy, model: model, original: frame.original, configuration: color)

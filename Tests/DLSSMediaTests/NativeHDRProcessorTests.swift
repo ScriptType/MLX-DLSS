@@ -24,7 +24,7 @@ final class NativeHDRProcessorTests: XCTestCase, @unchecked Sendable {
       throw XCTSkip("Set MLXDLSS_NEURAL_RENDERING_PACKAGE to validate the real model")
     }
     let processor = try NativeHDRProcessor(configuration: .init(modelURL: URL(fileURLWithPath: path),
-      processingWidth: 96, processingHeight: 64, strength: 0.6, colorStrength: 0.5, motion: .zero))
+      processingWidth: 64, processingHeight: 40, strength: 0.6, colorStrength: 0.5, motion: .zero))
     for index in 0..<3 {
       let source = try frame(index: UInt64(index), generation: index == 2 ? 2 : 1)
       let result = try await processor.process(source)

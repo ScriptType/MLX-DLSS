@@ -2,6 +2,15 @@ import Foundation
 import MLX
 import DLSSCore
 
+/// Range policy for native video colour after resizing to the processing extent.
+/// This does not convert transfer functions or constrain final HDR output.
+public enum MLXNeuralRenderingInputRange: Sendable {
+  /// Preserve the generic recovered renderer's floating-point input behavior.
+  case preserve
+  /// Admit an already sRGB-encoded proxy in [0, 1], including after Lanczos overshoot.
+  case boundedSRGB
+}
+
 /// Device-resident temporal path for the recovered neural-rendering transformer.
 ///
 /// Inputs and final RGB retain the portable `HostTensor` boundary. Base features
@@ -102,7 +111,8 @@ public actor MLXNeuralRenderingDeviceTemporalBackend: NeuralRenderBackend {
     context: NeuralRenderFrameContext, processingScale: Float = 1, temporal: Bool = true,
     outputOptions: MLXVideoOutputOptions? = nil,
     processingWidth: Int? = nil, processingHeight: Int? = nil,
-    featureControls: NeuralRenderingFeatureControls? = nil, intensity: Float? = nil
+    featureControls: NeuralRenderingFeatureControls? = nil, intensity: Float? = nil,
+    processingInputRange: MLXNeuralRenderingInputRange = .preserve
   ) async throws -> MLXVideoFrame {
     guard !nativeFrameInFlight else { throw MLXMediaError("Submit native NR frames sequentially") }
     nativeFrameInFlight = true
@@ -123,7 +133,8 @@ public actor MLXNeuralRenderingDeviceTemporalBackend: NeuralRenderBackend {
       (processingWidth == nil) == (processingHeight == nil) else {
       throw MLXMediaError("Specify both valid neural processing dimensions")
     }
-    let color = composition.resample(frame.array, width: width, height: height)
+    let color = Self.prepareVideoInput(frame.array, composition: composition,
+      width: width, height: height, range: processingInputRange)
     if nativeGuides?.width != width || nativeGuides?.height != height {
       nativeGuides = (width, height, MLXArray.zeros([1, height, width, 2]),
         MLXArray.ones([1, height, width, 1]))
@@ -144,6 +155,17 @@ public actor MLXNeuralRenderingDeviceTemporalBackend: NeuralRenderBackend {
       descriptors: descriptors, evaluateOutput: false,
       featureControls: featureControls, intensity: intensity)
     return MLXVideoFrame(composition(result.output, source: frame.array))
+  }
+
+  /// Shared by native admission and model-free boundary tests. Bound only after
+  /// all resize passes; features and postprocessing consume this same tensor.
+  static func prepareVideoInput(_ frame: MLXArray, composition: MLXVideoComposition,
+    width: Int, height: Int, range: MLXNeuralRenderingInputRange = .preserve) -> MLXArray {
+    let resized = composition.resample(frame, width: width, height: height)
+    switch range {
+    case .preserve: return resized
+    case .boundedSRGB: return clip(resized, min: Float(0), max: Float(1))
+    }
   }
 
   private func renderDevice(_ request: NeuralRenderRequest, evaluateOutput: Bool = true) async throws -> (output: MLXArray, nanoseconds: UInt64) {

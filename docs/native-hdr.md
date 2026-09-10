@@ -12,6 +12,8 @@ PQ uses the ST 2084 EOTF with 10,000-nit normalization. HLG uses inverse OETF fo
 
 `NativeHDRProcessor` retains model/kernel resources and motion history. It converts the original BT.2020 image to a separate sRGB/BT.709 proxy, divided by reference white, with a luminance shoulder above 0.75 and bounded sRGB output. Optical flow and neural processing see only that proxy. Explicit processing width/height can differ from source size; neural output is resampled to original size before reconstruction. Changing those dimensions resets model history without reloading weights.
 
+Native HDR opts into `processingInputRange: .boundedSRGB`: after all processing-size resize passes, RGB is bounded to [0, 1] before feature construction, temporal processing and head-to-colour postprocessing. This handles Lanczos overshoot in the resized SDR proxy. The generic native renderer defaults to `.preserve`; its resampler and recovered feature math retain their floating-point behavior. The bound does not change the retained HDR original, optical-flow input or identity reconstruction. It does not clamp final HDR output or change the HDR reconstruction equations, although enhanced pixels can change. It enforces the native HDR proxy policy, without establishing NVIDIA parity or explaining measured temporal variation.
+
 For BT.2020 working images, reconstruction computes linear BT.709 proxy/model luminances and a gain `clamp(modelY / proxyY, 0, maximumLuminanceRatio)`. It transforms the residual `modelRGB - proxyRGB * gain` into BT.2020 and adds it, scaled by colour strength, to `originalRGB * gain`. Effect strength mixes this result with the original. Proxy-black pixels keep their original; this avoids unstable division near black. The residual has zero BT.709 luminance before floating-point roundoff, so the gain limit controls luminance while colour strength controls chromatic change. Effect and colour strengths are 0–1, and the maximum gain is at least 1. The same equations run in the CPU reference and GPU codec.
 
 Identity-model reconstruction preserves original wide-gamut values that the SDR proxy cannot represent. Zero strength returns the same original frame object, without proxy quantization or model execution. The original is never replaced by an inverse tone curve. No final HDR clamp is applied; signed out-of-gamut components and extended values survive float packing. The existing BT.709 codec mode retains its original algorithm for compatibility.
@@ -21,6 +23,8 @@ Each processed result exposes original, proxy, identity-model and enhanced views
 ## Focused verification
 
 `MLXHDRFrameTests` checks NV12/P010, limited/full range and grey samples against independent double-precision SDR/PQ/HLG equations, saturated PQ samples, source metadata, primary conversion and half output above reference white. `MLXNeuralRenderingDisplayCodecTests` compares CPU/GPU BT.2020 reconstruction, identity and highlights. Native HDR processor tests exercise exact original bypass, discontinuities, decoded clips and an optional real model sequence. These checks establish numeric development behavior; they do not establish HDR display accuracy or M5 throughput.
+
+`MLXNeuralRenderingInputRangeTests` exercises the actual native admission helper on the GPU without loading model weights. It checks asymmetric high-contrast resizing against an independent Pillow Float32 reference, explicit/default preserved overshoot, and unchanged bounded input at equal dimensions.
 
 The development run on Apple M3/macOS 26.5 passed the focused HDR import/codec/processor checks plus existing CPU codec and NR/FG/VSR export regression. A three-frame real model sequence retained 960–965-nit highlights; identity reconstruction differed by at most 0.0000611 nits. Ten decoded PQ sample positions were independently reconstructed from FFmpeg-decoded YUV using double-precision equations and agreed with the native RGBA16F captures within half-float rounding (largest absolute difference 0.843 nits at approximately 2,171 nits). These are numeric checks, not target-hardware performance results.
 
@@ -32,7 +36,7 @@ MLXDLSS_HDR_FIXTURES="$PWD/assets/test-clips" \
 MLXDLSS_FG_WEIGHTS="$PWD/models/framegen.safetensors" \
 MLXDLSS_VSR_WEIGHTS="$PWD/models/vsr.safetensors" \
 swift test --package-path vendor/MLX-DLSS -c release --jobs 2 \
-  --filter 'MLXHDRFrameTests|MLXVideoFrameTests|MLXNeuralRenderingDisplayCodecTests|NativeHDRProcessorTests|NativeMediaProcessorTests|NeuralRenderingDisplayCodecTests'
+  --filter 'MLXHDRFrameTests|MLXVideoFrameTests|MLXNeuralRenderingInputRangeTests|MLXNeuralRenderingDisplayCodecTests|NativeHDRProcessorTests|NativeMediaProcessorTests|NeuralRenderingDisplayCodecTests'
 ```
 
 Importer/writer GPU durations come from completed Metal command buffers and are optional when the driver does not expose timestamps. Processor proxy/motion/inference/reconstruction timings measure completed stage wall time, including waits; they are not labeled isolated GPU timings.
