@@ -92,9 +92,69 @@ final class MLXNeuralRenderingDisplayCodecTests: XCTestCase {
       original: original,
       configuration: .init(transferStrength: 0)
     )
+    XCTAssertTrue(output === original)
     eval(output)
 
     XCTAssertEqual(output.asArray(Float.self), [4, 2, 1])
+    let originalFrame = MLXVideoFrame(original)
+    let frameOutput = MLXNeuralRenderingDisplayCodec().resolve(
+      proxy: MLXVideoFrame(proxy), model: MLXVideoFrame(model), original: originalFrame,
+      configuration: .init(transferStrength: 0))
+    XCTAssertTrue(frameOutput === originalFrame)
+  }
+
+  func testLazyResolvesRetainIndependentEffectParameters() throws {
+    let original = try tensor([1000, 1, 0, 0, 800, 20, -0.5, 20, 800, 5, 10, 15], width: 4, height: 1)
+    let firstConfiguration = NeuralRenderingDisplayCodecConfiguration(whitePoint: 203,
+      transferStrength: 0.25, colorStrength: 0, maximumLuminanceRatio: 1.5, workingPrimaries: .bt2020)
+    let secondConfiguration = NeuralRenderingDisplayCodecConfiguration(whitePoint: 203,
+      transferStrength: 0.875, colorStrength: 1, maximumLuminanceRatio: 1.5, workingPrimaries: .bt2020)
+    let proxy = try NeuralRenderingDisplayCodec.encode(original, configuration: firstConfiguration)
+    let model = try tensor(values(proxy).map { min(1, max(0, $0 * 0.8 + 0.04)) }, width: 4, height: 1)
+    let originalArray = array(original), proxyArray = array(proxy), modelArray = array(model)
+    let codec = MLXNeuralRenderingDisplayCodec()
+    let first = codec.resolve(proxy: proxyArray, model: modelArray, original: originalArray,
+      configuration: firstConfiguration)
+    let second = codec.resolve(proxy: proxyArray, model: modelArray, original: originalArray,
+      configuration: secondConfiguration)
+    // Build both graphs before evaluating either; the newer call must not
+    // overwrite the earlier graph's parameters, including in reverse order.
+    eval(second)
+    eval(first)
+    let firstValues = first.asArray(Float.self), secondValues = second.asArray(Float.self)
+    XCTAssertNotEqual(firstValues, secondValues)
+    for (actual, configuration) in [(firstValues, firstConfiguration), (secondValues, secondConfiguration)] {
+      let expected = try NeuralRenderingDisplayCodec.resolve(proxy: proxy, model: model,
+        original: original, configuration: configuration)
+      assertClose(actual, values(expected), tolerance: 0.0005)
+    }
+  }
+
+  func testEffectEndpointsMatchFrozenSpecializedCodec() throws {
+    let original = try tensor([1000, 1, 0, 0, 800, 20, -0.5, 20, 800, 0, 0, 0], width: 4, height: 1)
+    let proxy = try tensor([0.8, 0.01, 0.2, 0.02, 0.9, 0.1, 0.04045, 0.1, 0.7, 0, 0, 0], width: 4, height: 1)
+    let model = try tensor([0.6, 0.03, 0.25, 0.04, 0.75, 0.15, 0.03, 0.2, 0.8, 0, 0, 0], width: 4, height: 1)
+    let originalArray = array(original), proxyArray = array(proxy), modelArray = array(model)
+    let codec = MLXNeuralRenderingDisplayCodec()
+    let baselineCodec = FrozenRuntimeHDRControlsCodec()
+    for primaries in [NeuralRenderingDisplayCodecConfiguration.WorkingPrimaries.bt709, .bt2020] {
+      for displayReferred in [false, true] {
+        for transfer in [Float(0), 1] {
+          for colour in [Float(0), 1] {
+            let configuration = NeuralRenderingDisplayCodecConfiguration(whitePoint: 203,
+              transferStrength: transfer, colorStrength: colour, maximumLuminanceRatio: 1.5,
+              inputIsDisplayReferred: displayReferred, workingPrimaries: primaries)
+            let actual = codec.resolve(proxy: proxyArray, model: modelArray, original: originalArray,
+              configuration: configuration)
+            if transfer == 0 { XCTAssertTrue(actual === originalArray) }
+            let baseline = baselineCodec.resolve(proxy: proxyArray, model: modelArray,
+              original: originalArray, configuration: configuration)
+            XCTAssertEqual(actual.asArray(Float.self).map(\.bitPattern),
+              baseline.asArray(Float.self).map(\.bitPattern))
+          }
+        }
+      }
+    }
   }
 
   func testBT2020IdentityAndEnhancedWideGamutMatchCPU() throws {

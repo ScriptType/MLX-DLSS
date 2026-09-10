@@ -1,10 +1,11 @@
+@testable import DLSSMLX
 import MLX
 import DLSSCore
 
 /// Device-resident MLX/Metal implementation of `NeuralRenderingDisplayCodec`.
-public final class MLXNeuralRenderingDisplayCodec: @unchecked Sendable {
+public final class FrozenRuntimeHDRControlsCodec: @unchecked Sendable {
   private let encodeKernel = MLXFast.metalKernel(
-    name: "mlxdlss_display_codec_encode",
+    name: "mlxdlss_runtime_controls_baseline_encode",
     inputNames: ["original"],
     outputNames: ["proxy"],
     source: #"""
@@ -33,12 +34,12 @@ public final class MLXNeuralRenderingDisplayCodec: @unchecked Sendable {
       proxy[offset + 1] = encoded.y;
       proxy[offset + 2] = encoded.z;
       """#,
-    header: neuralRenderingDisplayCodecMetalHeader
+    header: frozenRuntimeHDRControlsMetalHeader
   )
 
   private let resolveKernel = MLXFast.metalKernel(
-    name: "mlxdlss_display_codec_resolve",
-    inputNames: ["proxy", "model", "original", "effects"],
+    name: "mlxdlss_runtime_controls_baseline_resolve",
+    inputNames: ["proxy", "model", "original"],
     outputNames: ["output"],
     source: #"""
       uint pixel = thread_position_in_grid.x;
@@ -48,8 +49,8 @@ public final class MLXNeuralRenderingDisplayCodec: @unchecked Sendable {
       }
       uint offset = pixel * 3;
       float whitePoint = as_type<float>(uint(whitePointBits));
-      float transferStrength = effects[0];
-      float colorStrength = effects[1];
+      float transferStrength = as_type<float>(uint(transferStrengthBits));
+      float colorStrength = as_type<float>(uint(colorStrengthBits));
       float maximumRatio = as_type<float>(uint(maximumRatioBits));
       float normalization = inputIsDisplayReferred ? 1.0f : whitePoint;
 
@@ -116,7 +117,7 @@ public final class MLXNeuralRenderingDisplayCodec: @unchecked Sendable {
       output[offset + 1] = result.y;
       output[offset + 2] = result.z;
       """#,
-    header: neuralRenderingDisplayCodecMetalHeader
+    header: frozenRuntimeHDRControlsMetalHeader
   )
 
   public init() {}
@@ -168,14 +169,13 @@ public final class MLXNeuralRenderingDisplayCodec: @unchecked Sendable {
     if configuration.transferStrength == 0 {
       return original
     }
-    // Each lazy resolve graph owns its immutable coefficient input. Reusing a
-    // mutable buffer here could change an earlier, not-yet-evaluated result.
-    let effects = MLXArray([configuration.transferStrength, configuration.colorStrength])
     return resolveKernel(
-      [proxy, model, original, effects],
+      [proxy, model, original],
       template: [
         ("workingBT2020", configuration.workingPrimaries == .bt2020),
         ("whitePointBits", Int(configuration.whitePoint.bitPattern)),
+        ("transferStrengthBits", Int(configuration.transferStrength.bitPattern)),
+        ("colorStrengthBits", Int(configuration.colorStrength.bitPattern)),
         ("maximumRatioBits", Int(configuration.maximumLuminanceRatio.bitPattern)),
         ("inputIsDisplayReferred", configuration.inputIsDisplayReferred),
       ],
@@ -206,7 +206,7 @@ public final class MLXNeuralRenderingDisplayCodec: @unchecked Sendable {
   }
 }
 
-private let neuralRenderingDisplayCodecMetalHeader = #"""
+private let frozenRuntimeHDRControlsMetalHeader = #"""
   using namespace metal;
   #pragma clang fp contract(off)
   #pragma clang fp reassociate(off)
