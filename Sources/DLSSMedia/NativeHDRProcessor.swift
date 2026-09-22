@@ -75,6 +75,41 @@ public actor NativeHDRProcessor {
       packageURL: $0, executionMode: .metalFused, computePrecision: configuration.precision) }
   }
 
+#if MLXDLSS_TEMPORAL_DIAGNOSTICS
+  public func enableTemporalDiagnostics(frameIndices: [UInt64]) async throws {
+    guard !busy, previous == nil, let renderer else {
+      throw MLXMediaError("Arm temporal diagnostics before native HDR processing")
+    }
+    busy = true
+    defer { busy = false }
+    try await renderer.enableTemporalDiagnostics(frameIndices: frameIndices)
+  }
+
+  public func temporalDiagnosticSnapshots() async throws -> [MLXTemporalDiagnosticSnapshot] {
+    guard !busy, let renderer else { throw MLXMediaError("Read temporal diagnostics between frames") }
+    busy = true
+    defer { busy = false }
+    return try await renderer.temporalDiagnosticSnapshots()
+  }
+
+  public func temporalDiagnosticState() async throws -> MLXTemporalDiagnosticState {
+    guard !busy, let renderer else { throw MLXMediaError("Read temporal state between frames") }
+    busy = true
+    defer { busy = false }
+    return try await renderer.temporalDiagnosticState()
+  }
+
+  public func replayTemporalDiagnostic(baseFrameIndex: UInt64, noiseFromFrameIndex: UInt64,
+    historyFromFrameIndex: UInt64) async throws -> MLXTemporalDiagnosticReplay {
+    guard !busy, !resetRequested, let renderer else { throw MLXMediaError("Replay between completed native frames") }
+    busy = true
+    defer { busy = false }
+    let replay = try await renderer.replayTemporalDiagnostic(baseFrameIndex: baseFrameIndex,
+      noiseFromFrameIndex: noiseFromFrameIndex, historyFromFrameIndex: historyFromFrameIndex)
+    if resetRequested { throw CancellationError() }
+    return replay
+  }
+#endif
   /// Strength changes preserve temporal inputs. Processing-size changes reset
   /// history before the next frame and do not reload the model weights.
   public func configure(strength: Float, colorStrength: Float, processingWidth: Int? = nil,

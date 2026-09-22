@@ -41,6 +41,13 @@ public actor MLXNeuralRenderingDeviceTemporalBackend: NeuralRenderBackend {
   private var nativeCompositionOptions: MLXVideoOutputOptions?
   private var nativeGuides: (width: Int, height: Int, motion: MLXArray, depth: MLXArray)?
   private var nativeFrameInFlight = false
+#if MLXDLSS_TEMPORAL_DIAGNOSTICS
+  private var diagnosticFrameIndices: Set<UInt64> = []
+  private var diagnosticCaptures: [UInt64: MLXTemporalDiagnosticArrays] = [:]
+  private var diagnosticReplayInFlight = false
+  private var diagnosticReplayCount = 0
+  private var diagnosticRepeatVerified = false
+#endif
 
   /// - Parameter geometry: how logical frames map onto the network extent.
   ///   `vendorAligned` (default) pads every frame to the recovered minimum
@@ -154,7 +161,18 @@ public actor MLXNeuralRenderingDeviceTemporalBackend: NeuralRenderBackend {
       depth: nativeGuides!.depth, controlMask: nil, historyConfidence: confidence,
       descriptors: descriptors, evaluateOutput: false,
       featureControls: featureControls, intensity: intensity)
+#if MLXDLSS_TEMPORAL_DIAGNOSTICS
+    let completed = MLXVideoFrame(composition(result.output, source: frame.array))
+    if var captured = diagnosticCaptures[context.frameIndex] {
+      // Retain only. No new evaluation or readback precedes the original completion.
+      captured.tensors["fullResolutionProxy"] = frame.array
+      captured.tensors["fullResolutionModel"] = completed.array
+      diagnosticCaptures[context.frameIndex] = captured
+    }
+    return completed
+#else
     return MLXVideoFrame(composition(result.output, source: frame.array))
+#endif
   }
 
   /// Shared by native admission and model-free boundary tests. Bound only after
@@ -226,6 +244,9 @@ public actor MLXNeuralRenderingDeviceTemporalBackend: NeuralRenderBackend {
     evaluateOutput: Bool, featureControls: NeuralRenderingFeatureControls? = nil,
     intensity: Float? = nil
   ) async throws -> (output: MLXArray, nanoseconds: UInt64) {
+#if MLXDLSS_TEMPORAL_DIAGNOSTICS
+    guard !diagnosticReplayInFlight else { throw MLXMediaError("A diagnostic replay is in progress") }
+#endif
     let featureControls = featureControls ?? self.featureControls
     let intensity = intensity ?? controlMaskIntensity
     if let resetRequest = try tracker.prepare(
@@ -342,6 +363,16 @@ public actor MLXNeuralRenderingDeviceTemporalBackend: NeuralRenderBackend {
       let executionNanoseconds = nanoseconds(
         in: started.duration(to: ContinuousClock.now)
       )
+#if MLXDLSS_TEMPORAL_DIAGNOSTICS
+      if diagnosticFrameIndices.contains(context.frameIndex) {
+        diagnosticCaptures[context.frameIndex] = diagnosticArrays(context: context,
+          geometry: geometry, color: colorArray, motion: motionArray, depth: depthArray,
+          controlMask: controlMaskArray, confidence: confidenceArray, incomingHistory: history,
+          noiseIndex: noiseFrameIndex, featureControls: featureControls, intensity: intensity,
+          features: features, networkFeatures: networkFeatures, preparedFeatures: preparedFeatures.array,
+          networkHead: networkHeadOutput, logicalHead: headOutput, output: output)
+      }
+#endif
       history = stopGradient(output)
       noiseFrameIndex &+= 1
       tracker.commit(context: context, inputDescriptors: descriptors)
@@ -501,6 +532,226 @@ public actor MLXNeuralRenderingDeviceTemporalBackend: NeuralRenderBackend {
       + UInt64(max(0, components.attoseconds) / 1_000_000_000)
   }
 }
+#if MLXDLSS_TEMPORAL_DIAGNOSTICS
+extension MLXNeuralRenderingDeviceTemporalBackend {
+  /// Arm at most two frames before a sequence starts. The harness must finish its
+  /// complete baseline parity gate before requesting exports or replay.
+  public func enableTemporalDiagnostics(frameIndices: [UInt64]) throws {
+    guard !nativeFrameInFlight, !diagnosticReplayInFlight, history == nil, noiseFrameIndex == 0,
+      diagnosticFrameIndices.isEmpty, (1...2).contains(frameIndices.count),
+      Set(frameIndices).count == frameIndices.count, frameIndices.allSatisfy({ $0 < 120 }) else {
+      throw MLXMediaError("Arm one or two unique diagnostic frames before processing")
+    }
+    diagnosticFrameIndices = Set(frameIndices)
+  }
+
+  public func temporalDiagnosticSnapshots() throws -> [MLXTemporalDiagnosticSnapshot] {
+    guard !nativeFrameInFlight, !diagnosticReplayInFlight,
+      diagnosticCaptures.count == diagnosticFrameIndices.count, !diagnosticCaptures.isEmpty,
+      diagnosticCaptures.values.allSatisfy({ $0.tensors["fullResolutionModel"] != nil }) else {
+      throw MLXMediaError("Diagnostic native captures are not complete")
+    }
+    return diagnosticCaptures.keys.sorted().map { diagnosticCaptures[$0]!.exported() }
+  }
+
+  public func temporalDiagnosticState() throws -> MLXTemporalDiagnosticState {
+    guard !nativeFrameInFlight, !diagnosticReplayInFlight else {
+      throw MLXMediaError("Read diagnostic state between completed calls")
+    }
+    return diagnosticStateValue()
+  }
+
+  private func diagnosticStateValue() -> MLXTemporalDiagnosticState {
+    var tensors: [String: MLXArray] = [:]
+    tensors["history"] = history
+    if let indices = extensionIndices {
+      tensors["extensionRows"] = indices.rows; tensors["extensionColumns"] = indices.columns
+    }
+    if let guides = nativeGuides {
+      tensors["nativeGuideMotion"] = guides.motion; tensors["nativeGuideDepth"] = guides.depth
+    }
+    return MLXTemporalDiagnosticState(noiseFrameIndex: noiseFrameIndex,
+      lifecycleDescription: String(reflecting: tracker),
+      nativeCompositionDescription: String(reflecting: nativeCompositionOptions),
+      deviceFeaturesEnabled: Self.deviceFeaturesEnabled,
+      tensors: tensors.mapValues { MLXTemporalDiagnosticTensor($0) })
+  }
+
+  private func diagnosticArrays(context: NeuralRenderFrameContext,
+    geometry: NeuralRenderingNetworkGeometry, color: MLXArray, motion: MLXArray,
+    depth: MLXArray, controlMask: MLXArray?, confidence: MLXArray?, incomingHistory: MLXArray?,
+    noiseIndex: UInt32, featureControls: NeuralRenderingFeatureControls, intensity: Float,
+    features: MLXArray, networkFeatures: MLXArray, preparedFeatures: MLXArray,
+    networkHead: MLXArray, logicalHead: MLXArray, output: MLXArray) -> MLXTemporalDiagnosticArrays {
+    var tensors = ["color": color, "motion": motion, "depth": depth,
+      "logicalFeatures": features, "networkFeatures": networkFeatures,
+      "preparedFeatures": preparedFeatures, "networkHead": networkHead,
+      "logicalHead": logicalHead, "postprocessedSDR": output]
+    tensors["controlMask"] = controlMask; tensors["confidence"] = confidence
+    tensors["incomingHistory"] = incomingHistory
+    return MLXTemporalDiagnosticArrays(context: context, geometry: geometry,
+      noiseIndex: noiseIndex, featureControls: featureControls, intensity: intensity, tensors: tensors)
+  }
+
+  /// Noncommitting state-factor replay, capped at four evaluations. The first must
+  /// repeat one captured state exactly; its bytes gate the remaining combinations.
+  /// This diagnostic is sequential and must never overlap processing/reset calls.
+  public func replayTemporalDiagnostic(baseFrameIndex: UInt64, noiseFromFrameIndex: UInt64,
+    historyFromFrameIndex: UInt64) async throws -> MLXTemporalDiagnosticReplay {
+    guard !nativeFrameInFlight, !diagnosticReplayInFlight, diagnosticReplayCount < 4,
+      let base = diagnosticCaptures[baseFrameIndex],
+      let noiseSource = diagnosticCaptures[noiseFromFrameIndex],
+      let historySource = diagnosticCaptures[historyFromFrameIndex],
+      let colorArray = base.tensors["color"], let motionArray = base.tensors["motion"],
+      let depthArray = base.tensors["depth"], let fullProxy = base.tensors["fullResolutionProxy"],
+      base.tensors["fullResolutionModel"] != nil,
+      let incomingHistory = historySource.tensors["incomingHistory"],
+      let composition = nativeComposition, let options = nativeCompositionOptions,
+      fullProxy.shape == [1, options.height, options.width, 3],
+      base.geometry == historySource.geometry, base.geometry == noiseSource.geometry else {
+      throw MLXMediaError("Missing, incompatible or busy temporal replay state")
+    }
+    guard diagnosticReplayCount == 0
+      ? (baseFrameIndex == noiseFromFrameIndex && baseFrameIndex == historyFromFrameIndex)
+      : diagnosticRepeatVerified else {
+      throw MLXMediaError("An exact identical-state replay must precede attribution")
+    }
+    let stateBefore = diagnosticStateValue()
+    let savedHistory = self.history, savedNoise = self.noiseFrameIndex, savedTracker = tracker
+    let savedExtensionIndices = extensionIndices
+    diagnosticReplayInFlight = true
+    defer {
+      // Restore even on failure; no baseline lifecycle is committed by this path.
+      self.history = savedHistory; self.noiseFrameIndex = savedNoise; tracker = savedTracker
+      extensionIndices = savedExtensionIndices
+      diagnosticReplayInFlight = false
+    }
+    let history: MLXArray? = incomingHistory
+    let noiseFrameIndex = noiseSource.noiseIndex
+    let confidenceArray = base.tensors["confidence"], controlMaskArray = base.tensors["controlMask"]
+    let featureControls = base.featureControls, intensity = base.intensity
+    // BEGIN DIAGNOSTIC GRAPH COPY: exact renderArrays graph assembly below.
+      let logicalHeight = colorArray.shape[1]
+      let logicalWidth = colorArray.shape[2]
+      let geometry = try geometryPolicy.resolve(
+        outputWidth: logicalWidth,
+        outputHeight: logicalHeight
+      )
+      let features: MLXArray
+      let networkFeatures: MLXArray
+      if Self.deviceFeaturesEnabled, let history, geometry.isIdentity {
+        // Base features and the reprojected history in one kernel; nothing but the
+        // colour, motion and depth crosses the host boundary.
+        features = temporalProcessor(
+          color: colorArray,
+          controlMask: controlMaskArray,
+          noiseFrameIndex: noiseFrameIndex,
+          history: history,
+          historyTransform: historyTransform,
+          motion: motionArray,
+          motionTransform: motionTransform,
+          depth: depthArray,
+          depthInverted: depthInverted,
+          depthGuideMode: .observedZeroDescriptor,
+          historyConfidence: confidenceArray,
+          featureControls: featureControls
+        )
+        networkFeatures = features
+      } else {
+        let networkBaseFeatures: MLXArray
+        if Self.deviceFeaturesEnabled {
+          // The base features at the network extent from the colour gathered onto it
+          // (the noise is a function of the network pixel, as in the CPU preprocessor).
+          let extendedColor = geometry.isIdentity ? colorArray : extendColor(colorArray, geometry: geometry)
+          let extendedMask = controlMaskArray.map { geometry.isIdentity ? $0 : extendColor($0, geometry: geometry) }
+          networkBaseFeatures = baseFeatureProcessor(
+            color: extendedColor,
+            controlMask: extendedMask,
+            noiseFrameIndex: noiseFrameIndex,
+            featureControls: featureControls
+          )
+        } else {
+          let baseFeatureTensor = try NeuralRenderingFirstFramePreprocessor.makeFeatureTensor(
+            from: try hostTensor(colorArray, shape: colorArray.shape),
+            noiseFrameIndex: noiseFrameIndex,
+            geometry: geometry,
+            normalizedStyle: featureControls.normalizedStyle,
+            localToneStrength: featureControls.localToneStrength,
+            localStructureStrength: featureControls.localStructureStrength,
+            automaticMask: featureControls.automaticMask,
+            controlMask: try controlMaskArray.map { try hostTensor($0, shape: $0.shape) }
+          )
+          networkBaseFeatures = array(baseFeatureTensor)
+        }
+        let logicalBaseFeatures =
+          geometry.isIdentity
+          ? networkBaseFeatures
+          : networkBaseFeatures[0..., 0..<logicalHeight, 0..<logicalWidth, 0...]
+        if let history {
+          features = temporalProcessor(
+            baseFeatures: logicalBaseFeatures,
+            history: history,
+            historyTransform: historyTransform,
+            motion: motionArray,
+            motionTransform: motionTransform,
+            depth: depthArray,
+            depthInverted: depthInverted,
+            depthGuideMode: .observedZeroDescriptor,
+            historyConfidence: confidenceArray,
+            featureControls: featureControls
+          )
+          networkFeatures =
+            geometry.isIdentity
+            ? features
+            : extendToNetworkExtent(
+              features,
+              networkBaseFeatures: networkBaseFeatures,
+              geometry: geometry
+            )
+        } else {
+          features = logicalBaseFeatures
+          networkFeatures = networkBaseFeatures
+        }
+      }
+      let preparedFeatures = MLXArrayTransfer(
+        array: networkFeatures.asType(computePrecision.mlxDataType)
+      )
+      let networkHeadOutput = try await head.statelessOutputTransfer(preparedFeatures).array
+      let headOutput =
+        geometry.isIdentity
+        ? networkHeadOutput
+        : networkHeadOutput[0..., 0..<logicalHeight, 0..<logicalWidth, 0...]
+      let output = postprocessor(
+        head: headOutput,
+        currentColor: colorArray,
+        features: features,
+        hasHistory: history != nil,
+        historyConfidence: confidenceArray,
+        controlMask: controlMaskArray,
+        intensity: intensity
+      )
+    // END DIAGNOSTIC GRAPH COPY
+    let model = MLXVideoFrame(composition(output, source: fullProxy))
+    var replay = diagnosticArrays(context: base.context, geometry: geometry,
+      color: colorArray, motion: motionArray, depth: depthArray, controlMask: controlMaskArray,
+      confidence: confidenceArray, incomingHistory: history, noiseIndex: noiseFrameIndex,
+      featureControls: featureControls, intensity: intensity, features: features,
+      networkFeatures: networkFeatures, preparedFeatures: preparedFeatures.array,
+      networkHead: networkHeadOutput, logicalHead: headOutput, output: output)
+    replay.tensors["fullResolutionProxy"] = fullProxy
+    replay.tensors["fullResolutionModel"] = model.array
+    let snapshot = replay.exported()
+    let stateAfter = diagnosticStateValue()
+    guard stateBefore == stateAfter else {
+      throw MLXMediaError("Noncommitting replay changed retained temporal state")
+    }
+    if diagnosticReplayCount == 0 { diagnosticRepeatVerified = snapshot == base.exported() }
+    diagnosticReplayCount += 1
+    return MLXTemporalDiagnosticReplay(snapshot: snapshot, fullResolutionModel: model,
+      stateBefore: stateBefore, stateAfter: stateAfter)
+  }
+}
+#endif
 
 public enum MLXTemporalConfidenceError: Error, Equatable, Sendable {
   case invalidValues
