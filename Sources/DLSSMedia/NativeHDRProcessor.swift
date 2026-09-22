@@ -32,17 +32,17 @@ public struct NativeHDRProcessingConfiguration: Sendable {
   }
 }
 
-/// Every view refers to one retained source frame and exact rational timestamp.
-/// Original, identity and enhanced are linear BT.2020 nits; proxy is bounded sRGB.
-/// Display mapping belongs to the presenter and must run once after this result.
+/// Completed stage wall times, including GPU waits; not isolated GPU durations.
 public struct NativeHDRStageTimings: Sendable {
-  /// Completed stage wall time, including GPU waits; not isolated GPU duration.
   public var proxySeconds: Double = 0
   public var motionSeconds: Double = 0
   public var inferenceSeconds: Double = 0
   public var reconstructionSeconds: Double = 0
 }
 
+/// Every view refers to one retained source frame and exact rational timestamp.
+/// Original, identity and enhanced are linear BT.2020 nits; proxy is bounded sRGB.
+/// Display mapping belongs to the presenter and must run once after this result.
 public struct NativeHDRProcessedFrame: Sendable {
   public let source: MLXHDRFrame
   public let proxy: MLXVideoFrame

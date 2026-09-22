@@ -157,8 +157,7 @@ public actor MLXNeuralRenderingDeviceTemporalBackend: NeuralRenderBackend {
     return MLXVideoFrame(composition(result.output, source: frame.array))
   }
 
-  /// Shared by native admission and model-free boundary tests. Bound only after
-  /// all resize passes; features and postprocessing consume this same tensor.
+  /// Bound only after all resize passes; features and postprocessing consume this same tensor.
   static func prepareVideoInput(_ frame: MLXArray, composition: MLXVideoComposition,
     width: Int, height: Int, range: MLXNeuralRenderingInputRange = .preserve) -> MLXArray {
     let resized = composition.resample(frame, width: width, height: height)
