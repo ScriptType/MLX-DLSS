@@ -793,11 +793,14 @@ struct NeuralRenderingTrunk {
   func callAsFunction(_ input: MLXArray) -> NeuralRenderingTrunkOutput {
     let encoded = encoder(input)
     let split = splitEncoder(encoded.latent)
+    asyncEval(split.skip, split.latent)
+    let latent = globalStage(split.latent)
+    asyncEval(latent)
     return NeuralRenderingTrunkOutput(
       fullResolutionSkip: encoded.fullResolutionSkip,
       skips: encoded.skips,
       splitSkip: split.skip,
-      latent: globalStage(split.latent)
+      latent: latent
     )
   }
 }
@@ -1027,8 +1030,11 @@ struct NeuralRenderingDecoder {
   func callAsFunction(_ input: MLXArray, skips: [MLXArray]) -> MLXArray {
     precondition(skips.count == 4)
     let firstOutput = first(input, skip: skips[3])
+    asyncEval(firstOutput)
     let secondOutput = second(firstOutput, skip: skips[2])
+    asyncEval(secondOutput)
     let thirdOutput = third(secondOutput, skip: skips[1])
+    asyncEval(thirdOutput)
     return fourth(thirdOutput, skip: skips[0])
   }
 }
@@ -1135,6 +1141,7 @@ struct NeuralRenderingTransformerModel {
   func callAsFunction(_ input: MLXArray) -> MLXArray {
     let encoded = trunk(input)
     let decoderStart = decoderInput(encoded.latent, skip: encoded.splitSkip)
+    asyncEval(decoderStart)
     let decoded = decoder(decoderStart, skips: encoded.skips)
     return post(decoded, skip: encoded.fullResolutionSkip)
   }
@@ -1429,11 +1436,17 @@ struct NeuralRenderingEncoder {
     )
   }
 
+  /// Each stage is scheduled as soon as its graph exists, so the GPU runs it
+  /// while the CPU is still building the rest of the network.
   func callAsFunction(_ input: MLXArray) -> NeuralRenderingEncoderOutput {
     let firstOutput = first(input)
+    asyncEval(firstOutput.fullResolutionSkip, firstOutput.skip, firstOutput.downsampled)
     let secondOutput = second(firstOutput.downsampled)
+    asyncEval(secondOutput.skip, secondOutput.downsampled)
     let thirdOutput = third(secondOutput.downsampled)
+    asyncEval(thirdOutput.skip, thirdOutput.downsampled)
     let fourthOutput = fourth(thirdOutput.downsampled)
+    asyncEval(fourthOutput.skip, fourthOutput.downsampled)
     return NeuralRenderingEncoderOutput(
       fullResolutionSkip: firstOutput.fullResolutionSkip,
       skips: [
