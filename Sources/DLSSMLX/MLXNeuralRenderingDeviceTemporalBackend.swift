@@ -133,6 +133,8 @@ public actor MLXNeuralRenderingDeviceTemporalBackend: NeuralRenderBackend {
       (processingWidth == nil) == (processingHeight == nil) else {
       throw MLXMediaError("Specify both valid neural processing dimensions")
     }
+    let signposter = MLXRuntimeDiagnostics.signposter
+    let graph = signposter.beginInterval("inference graph")
     let color = Self.prepareVideoInput(frame.array, composition: composition,
       width: width, height: height, range: processingInputRange)
     if nativeGuides?.width != width || nativeGuides?.height != height {
@@ -154,7 +156,9 @@ public actor MLXNeuralRenderingDeviceTemporalBackend: NeuralRenderBackend {
       depth: nativeGuides!.depth, controlMask: nil, historyConfidence: confidence,
       descriptors: descriptors, evaluateOutput: false,
       featureControls: featureControls, intensity: intensity)
-    return MLXVideoFrame(composition(result.output, source: frame.array))
+    let output = composition(result.output, source: frame.array)
+    signposter.endInterval("inference graph", graph)
+    return signposter.withIntervalSignpost("inference eval") { MLXVideoFrame(output) }
   }
 
   /// Bound only after all resize passes; features and postprocessing consume this same tensor.

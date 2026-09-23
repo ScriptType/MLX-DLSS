@@ -146,18 +146,23 @@ public actor NativeHDRProcessor {
       transferStrength: configuration.strength, colorStrength: configuration.colorStrength,
       maximumLuminanceRatio: configuration.maximumLuminanceRatio, workingPrimaries: .bt2020)
     var timings = NativeHDRStageTimings()
+    let signposter = MLXRuntimeDiagnostics.signposter
     var stage = ContinuousClock.now
-    let proxy = codec.encode(frame.original, configuration: color)
+    let proxy = signposter.withIntervalSignpost("proxy") { codec.encode(frame.original, configuration: color) }
     timings.proxySeconds = seconds(since: stage)
     stage = .now
-    let identity = codec.resolve(proxy: proxy, model: proxy, original: frame.original, configuration: color)
+    let identity = signposter.withIntervalSignpost("identity") {
+      codec.resolve(proxy: proxy, model: proxy, original: frame.original, configuration: color)
+    }
     timings.reconstructionSeconds = seconds(since: stage)
     var enhanced = frame.original
     var sceneCut = false
     if let renderer, configuration.strength > 0 {
       stage = .now
-      let motion = try await flow?.prepare(proxy, index: Int(truncatingIfNeeded: metadata.frameIndex),
-        sceneCutThreshold: configuration.sceneCutThreshold)
+      let motion = try await MLXRuntimeDiagnostics.stage("motion") {
+        try await flow?.prepare(proxy, index: Int(truncatingIfNeeded: metadata.frameIndex),
+          sceneCutThreshold: configuration.sceneCutThreshold)
+      }
       timings.motionSeconds = seconds(since: stage)
       stage = .now
       sceneCut = motion?.reset == true
@@ -169,7 +174,9 @@ public actor NativeHDRProcessor {
         processingInputRange: .boundedSRGB)
       timings.inferenceSeconds = seconds(since: stage)
       stage = .now
-      enhanced = codec.resolve(proxy: proxy, model: model, original: frame.original, configuration: color)
+      enhanced = signposter.withIntervalSignpost("resolve") {
+        codec.resolve(proxy: proxy, model: model, original: frame.original, configuration: color)
+      }
       timings.reconstructionSeconds += seconds(since: stage)
     } else if configuration.strength == 0 {
       // Skipped model input cannot be a temporal predecessor when re-enabled.
